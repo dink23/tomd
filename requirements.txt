@@ -1,0 +1,6 @@
+pdfplumber
+openpyxl
+xlrd
+python-docx
+python-pptx
+olefile

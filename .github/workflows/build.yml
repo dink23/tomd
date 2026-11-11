@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --windowed --name tomd
+          --collect-data docx --collect-data pptx --collect-data pdfminer
+          --collect-all pypdfium2 --collect-all pypdfium2_raw
+          run.py
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $env:TOMD_QUIET = "1"
+          $p = Start-Process -FilePath "dist\tomd\tomd.exe" -ArgumentList "tests\samples" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Get-Content "$env:LOCALAPPDATA\ToMD\log.txt" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          $count = (Get-ChildItem "tests\samples" -Filter *.md).Count
+          Write-Host "converted: $count"
+          if ($count -lt 6) { exit 1 }
+          Remove-Item "tests\samples\*.md"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*" -Filter ISCC.exe -Recurse | Select-Object -First 1
+          & $iscc.FullName "/DAppVersion=1.0.${{ github.run_number }}" "installer\tomd.iss"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ToMD-Setup
+          path: installer/Output/ToMD-Setup.exe
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "v1.0.${{ github.run_number }}" "installer/Output/ToMD-Setup.exe"
+          --title "ToMD 1.0.${{ github.run_number }}"
+          --notes "ToMD-Setup.exe를 내려받아 실행하면 설치됩니다."
+          --latest

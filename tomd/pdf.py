@@ -148,7 +148,8 @@ def _align_small_glyphs(chars):
                 ch["x0"] - prev["x1"] <= 0.6 * prev["height"]
                 and ch["x0"] >= prev["x0"] - 0.5 * prev["height"]
             )
-            if adjacent and overlap >= 0.6 * min(ch["height"], prev["height"]):
+            similar = min(ch["height"], prev["height"]) >= 0.5 * max(ch["height"], prev["height"])
+            if adjacent and similar and overlap >= 0.6 * min(ch["height"], prev["height"]):
                 ch = dict(ch)
                 shift = prev["top"] - ch["top"]
                 ch["top"], ch["bottom"] = prev["top"], prev["bottom"]
@@ -164,6 +165,33 @@ def _align_small_glyphs(chars):
         out.append(ch)
         prev = ch
     return out
+
+
+_LETTER = re.compile(r"[가-힣A-Za-z]")
+
+
+def _vertical_runs(chars):
+    """한 글자씩 세로로 쌓아 쓴 글(책등, 세로 제목)을 찾아 (첫 글자 위치, 글, 글자들)로 돌려준다."""
+    runs, current = [], []
+
+    def close():
+        letters = sum(1 for c in current if _LETTER.match(c["text"]))
+        if len(current) >= 5 and letters >= 0.8 * len(current):
+            runs.append(list(current))
+        current.clear()
+
+    for ch in chars:
+        if ch["text"].isspace():
+            continue
+        if current:
+            prev = current[-1]
+            step = ch["top"] - prev["top"]
+            same_column = abs((ch["x0"] + ch["x1"]) / 2 - (prev["x0"] + prev["x1"]) / 2) < 0.3 * max(prev["width"], 1)
+            if not (same_column and 0.7 * prev["height"] <= step <= 2.2 * prev["height"]):
+                close()
+        current.append(ch)
+    close()
+    return runs
 
 
 def _clean_page(page):
@@ -479,6 +507,14 @@ def _cell_texts(tbl, chars, tol, ytol=3):
             except Exception:
                 pass
     total = sum(1 for ch in inside if not ch["text"].isspace())
+    # 글자보다 좁은 칸에 글자가 들어가 있으면 표가 아니라 그라데이션 같은 장식 도형이다
+    squeezed = sum(
+        1 for ch in inside
+        if not ch["text"].isspace() and id(ch) in cell_of
+        and cell_of[id(ch)][2] - cell_of[id(ch)][0] < 0.9 * ch["width"]
+    )
+    if total and squeezed > 0.3 * total:
+        sprawling = "decoration"
     return texts, orphans, total, sprawling, claimed
 
 
@@ -517,7 +553,7 @@ def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None):
     if chars is not None:
         texts, orphans, total, sprawling, taken = _cell_texts(tbl, chars, tol, ytol)
         if sprawling or len(orphans) > max(3, total * 0.03):
-            raise _Broken()
+            raise _Broken("decoration" if sprawling == "decoration" else "")
         if claimed is not None:
             claimed.update(taken)
         for bbox in set(tbl.cells) | set(texts):
@@ -553,7 +589,7 @@ def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None):
 
 # ---------------------------------------------------------------- 쪽 변환
 
-def _region_fallback(page, bbox, tol, lost, ytol=3):
+def _region_fallback(page, bbox, tol, lost, ytol=3, plain_only=False):
     """세로선이 없는 표: 글자 정렬로 칸을 추정하고, 그것도 글자를 놓치면 줄글로 내보낸다."""
     def centered(obj):
         if "x0" not in obj or "top" not in obj:
@@ -571,6 +607,8 @@ def _region_fallback(page, bbox, tol, lost, ytol=3):
     lost[0] += sum(n for _, n in lines)
     plain = "\n".join(t.strip() for t, _ in lines if t.strip())
     want = len(re.sub(r"\s", "", plain))
+    if plain_only:
+        return plain.replace("\n", "  \n")
     try:
         grid = region.extract_table({
             "vertical_strategy": "text", "horizontal_strategy": "text",
@@ -603,7 +641,27 @@ def _drop_nested(tables):
 
 
 def _page_blocks(page, shifts=None):
-    page, rotated, extra = _upright_page(_clean_page(page))
+    page = _clean_page(page)
+    # 세로로 쌓아 쓴 글은 가로 글과 섞이면 한 글자씩 흩어지므로 따로 떼어 한 줄로 만든다
+    vertical = []
+    try:
+        runs = _vertical_runs(page.chars)
+    except Exception:
+        runs = []
+    if runs:
+        taken = {id(c) for run in runs for c in run}
+        for run in runs:
+            text, last = "", None
+            for c in run:
+                if last is not None and c["top"] - last["bottom"] > 0.5 * last["height"]:
+                    text += " "
+                text += c["text"]
+                last = c
+            vertical.append((run[0]["top"], text))
+        page = page.filter(lambda o: id(o) not in taken)
+    page, rotated, extra = _upright_page(page)
+    if rotated:
+        vertical = []
     tol = 1.5 if rotated else 3
     lost = [0]
     heights = sorted(c["bottom"] - c["top"] for c in page.chars) or [10]
@@ -621,10 +679,10 @@ def _page_blocks(page, shifts=None):
         bbox = t.bbox
         try:
             rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol, claimed))
-        except _Broken:
+        except _Broken as broken:
             # 표 영역이 실제보다 좁게 잡히는 일이 많아 같은 높이의 쪽 전체 너비를 본다
             bbox = (page.bbox[0], t.bbox[1], page.bbox[2], t.bbox[3])
-            rendered = _region_fallback(page, bbox, tol, lost, ytol)
+            rendered = _region_fallback(page, bbox, tol, lost, ytol, plain_only=str(broken) == "decoration")
         except Exception:
             grid = [[(c or "") for c in row] for row in t.extract()]
             rendered = table.render(table.from_grid(grid))
@@ -646,6 +704,8 @@ def _page_blocks(page, shifts=None):
         items.append((line["top"], "text", line))
     for bbox, rendered in prepared:
         items.append((bbox[1], "table", rendered))
+    for top, text in vertical:
+        items.append((top, "table", text))
     items.sort(key=lambda x: x[0])
 
     blocks, para, last_bottom = [], [], None

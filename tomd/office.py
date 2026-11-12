@@ -245,39 +245,98 @@ def convert_docx(path):
 
 # ---------------------------------------------------------------- 파워포인트
 
+_BULLET = re.compile(r"^\s*[•·▪■□◦○●∙‣◆◇▶▷►\-–—]\s+")
+_P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+
+
+def _ph_type(shape):
+    """자리 표시자 종류 이름(TITLE, BODY, SLIDE_NUMBER …). 자리 표시자가 아니면 빈 문자열."""
+    try:
+        if shape.is_placeholder:
+            return str(shape.placeholder_format.type).split(".")[-1].split(" ")[0]
+    except Exception:
+        pass
+    return ""
+
+
+def _para_text(para):
+    # 문단 안의 줄바꿈(Shift+Enter)은 python-pptx가 세로 탭으로 돌려준다.
+    # 대개 글상자 너비에 맞춘 줄 나눔이므로 빈칸으로 잇는다.
+    return re.sub(r" {2,}", " ", (para.text or "").replace("\x0b", " ")).strip()
+
+
+def _text_frame_md(shape):
+    """글상자 하나를 마크다운으로. 목록이면 글머리표, 아니면 줄글로 만든다."""
+    paras = [(p.level or 0, _para_text(p)) for p in shape.text_frame.paragraphs]
+    paras = [(lv, t) for lv, t in paras if t]
+    if not paras:
+        return ""
+    body = _ph_type(shape) in ("BODY", "OBJECT", "SUBTITLE") and len(paras) > 1
+    marked = any(_BULLET.match(t) for _, t in paras)
+    if not body and not marked:
+        # 목록이 아닌 글상자: 문단마다 줄을 바꿔 한 덩어리로
+        return "  \n".join(t.replace("\n", "  \n") for _, t in paras)
+    lines, seen_marker = [], False
+    for level, text in paras:
+        flat = " ".join(text.split("\n"))
+        if marked:
+            if _BULLET.match(flat):
+                seen_marker = True
+                lines.append("  " * level + "- " + _BULLET.sub("", flat))
+            elif seen_marker:
+                # 글머리표 항목 바로 아래의 설명 줄은 한 단계 들여 쓴다
+                lines.append("  " * (level + 1) + "- " + flat)
+            else:
+                lines.append(flat + "  ")
+        else:
+            lines.append("  " * level + "- " + flat)
+    return "\n".join(lines).rstrip()
+
+
 def convert_pptx(path):
     from pptx import Presentation
 
     prs = Presentation(path)
     out = []
     for n, slide in enumerate(prs.slides, 1):
-        title_shape = slide.shapes.title
-        title = title_shape.text_frame.text.strip() if title_shape is not None else ""
-        out.append(f"## 슬라이드 {n}" + (f": {' '.join(title.split())}" if title else ""))
+        title_shape = None
+        for shape in slide.shapes:
+            if _ph_type(shape) in ("TITLE", "CENTER_TITLE") and shape.has_text_frame:
+                if shape.text_frame.text.strip():
+                    title_shape = shape
+                    break
+        title = " ".join(title_shape.text_frame.text.split()) if title_shape is not None else ""
+        hidden = slide._element.get("show") in ("0", "false")
+        heading = f"## 슬라이드 {n}" + (" (숨김)" if hidden else "") + (f": {title}" if title else "")
+        out.append(heading)
+        pictures = [0]
 
         def walk(shapes):
             for shape in shapes:
                 if title_shape is not None and shape.shape_id == title_shape.shape_id:
                     continue
+                kind = _ph_type(shape)
+                if kind in ("SLIDE_NUMBER", "DATE"):
+                    continue  # 쪽 번호·날짜 칸
                 if shape.shape_type == 6:  # 그룹
                     walk(shape.shapes)
+                elif shape.shape_type == 13:  # 그림
+                    pictures[0] += 1
                 elif getattr(shape, "has_table", False) and shape.has_table:
                     grid = [[c.text for c in row.cells] for row in shape.table.rows]
                     rendered = table.render(table.from_grid(grid))
                     if rendered:
                         out.append(rendered)
                 elif shape.has_text_frame:
-                    lines = []
-                    for para in shape.text_frame.paragraphs:
-                        text = "".join(run.text for run in para.runs).strip()
-                        if text:
-                            lines.append("  " * para.level + "- " + text)
-                    if lines:
-                        out.append("\n".join(lines))
+                    rendered = _text_frame_md(shape)
+                    if rendered:
+                        out.append(rendered)
 
         walk(slide.shapes)
+        if pictures[0]:
+            out.append(f"[그림 {pictures[0]}개]")
         if slide.has_notes_slide:
             notes = slide.notes_slide.notes_text_frame.text.strip()
             if notes:
-                out.append("> 발표자 노트: " + notes.replace("\n", "\n> "))
+                out.append("> 발표자 노트: " + notes.replace("\x0b", "\n").replace("\n", "\n> "))
     return "\n\n".join(out)

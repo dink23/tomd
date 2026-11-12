@@ -266,7 +266,11 @@ class Engine(threading.Thread):
                 else:
                     body = job.futures[0][0].result()
                 body = (body or "").strip() or "> 이 파일에서 변환할 내용을 찾지 못했습니다."
-                target = write_new(job.path, f"# {job.path.stem}\n\n{body}\n")
+                from . import __version__
+
+                target = write_new(
+                    job.path, f"# {job.path.stem}\n\n{body}\n\n<!-- ToMD v{__version__}로 변환 -->\n"
+                )
                 with self._state_lock:
                     self.outputs.append(target)
             except Exception as exc:

@@ -101,14 +101,77 @@ def _snap(values, tolerance):
     return mapping
 
 
-def _table_cells(tbl, tol=3, lost=None):
-    texts = tbl.extract(x_tolerance=tol)
+def _cell_texts(tbl, chars, tol):
+    """글자를 그 글자가 들어 있는 가장 작은 셀에 배정해 셀별 글을 만든다.
+
+    세로선이 일부만 그어진 표에서는 큰 셀이 작은 셀들을 덮고 있어,
+    단순히 셀 영역으로 자르면 아래 칸들의 글이 큰 셀에 함께 딸려 온다.
+    """
+    from bisect import bisect_right
+
+    from pdfplumber.utils import extract_text
+
+    boxes = sorted(set(tbl.cells), key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    xs = sorted({v for b in boxes for v in (b[0], b[2])})
+    ys = sorted({v for b in boxes for v in (b[1], b[3])})
+    xi = {v: i for i, v in enumerate(xs)}
+    yi = {v: i for i, v in enumerate(ys)}
+    slot = {}
+    for b in boxes:  # 큰 셀부터 채우고 작은 셀이 덮어쓴다
+        for i in range(xi[b[0]], xi[b[2]]):
+            for j in range(yi[b[1]], yi[b[3]]):
+                slot[(i, j)] = b
+    groups = {}
+    x0, top, x1, bottom = tbl.bbox
+    for ch in chars:
+        cx = (ch["x0"] + ch["x1"]) / 2
+        cy = (ch["top"] + ch["bottom"]) / 2
+        if not (x0 <= cx <= x1 and top <= cy <= bottom):
+            continue
+        b = slot.get((bisect_right(xs, cx) - 1, bisect_right(ys, cy) - 1))
+        if b is not None:
+            groups.setdefault(b, []).append(ch)
+    return {b: extract_text(cs, x_tolerance=tol).strip() for b, cs in groups.items()}
+
+
+def _merge_wrapped_rows(cells):
+    """여러 줄로 나뉜 항목 이름 칸을 한 행으로 합친다.
+
+    같은 행 범위를 통째로 차지하는 칸(금액 등)이 그 범위 안에서 줄마다 나뉜 칸보다
+    많으면, 나뉜 칸들은 한 항목이 줄바꿈된 것으로 본다.
+    """
+    spans = sorted({(c.row, c.row + c.rowspan - 1) for c in cells if c.rowspan > 1 and c.text},
+                   key=lambda s: s[1] - s[0])
+    for a, b in spans:
+        whole = [c for c in cells if c.text and c.row == a and c.row + c.rowspan - 1 == b]
+        parts = [c for c in cells if c.text and a <= c.row and c.row + c.rowspan - 1 <= b
+                 and not (c.row == a and c.row + c.rowspan - 1 == b)]
+        cols = {c.col for c in parts}
+        if not parts or len(whole) <= len(cols):
+            continue
+        for col in cols:
+            group = sorted((c for c in parts if c.col == col), key=lambda c: c.row)
+            first = group[0]
+            first.text = "\n".join(c.text for c in group)
+            first.rowspan = b - a + 1
+            first.row = a
+            for c in group[1:]:
+                cells.remove(c)
+    return cells
+
+
+def _table_cells(tbl, tol=3, lost=None, chars=None):
+    texts = _cell_texts(tbl, chars, tol) if chars is not None else None
+    fallback = tbl.extract(x_tolerance=tol) if texts is None else None
     raw = []
     for r, row in enumerate(tbl.rows):
         for j, bbox in enumerate(row.cells):
             if bbox is None:
                 continue
-            text = texts[r][j] if j < len(texts[r]) else ""
+            if texts is not None:
+                text = texts.get(bbox, "")
+            else:
+                text = fallback[r][j] if j < len(fallback[r]) else ""
             text, n = _CID.subn("", text or "")
             if lost is not None:
                 lost[0] += n
@@ -125,10 +188,22 @@ def _table_cells(tbl, tol=3, lost=None):
                 continue
             c1, r1 = max(c1, c0 + 1), max(r1, r0 + 1)
         cells.append(Cell(r0, c0, text, r1 - r0, c1 - c0))
-    return cells
+    return _merge_wrapped_rows(cells)
 
 
 # ---------------------------------------------------------------- 쪽 변환
+
+def _drop_nested(tables):
+    """다른 표의 영역 안에 완전히 들어 있는 표(칸 안 글상자가 표로 잡힌 것)를 뺀다."""
+    def inside(a, b):
+        return a[0] >= b[0] - 1 and a[1] >= b[1] - 1 and a[2] <= b[2] + 1 and a[3] <= b[3] + 1
+
+    keep = []
+    for t in tables:
+        if not any(o is not t and inside(t.bbox, o.bbox) and not inside(o.bbox, t.bbox) for o in tables):
+            keep.append(t)
+    return keep
+
 
 def _page_blocks(page):
     page, rotated = _upright_page(page)
@@ -137,7 +212,9 @@ def _page_blocks(page):
         tables = page.find_tables({"text_x_tolerance": tol})
     except Exception:
         tables = []
+    tables = _drop_nested(tables)
     boxes = [t.bbox for t in tables]
+    chars = page.chars if tables else None
 
     def outside(obj):
         if "x0" not in obj or "top" not in obj:
@@ -162,7 +239,7 @@ def _page_blocks(page):
                 blocks.append("\n".join(para))
                 para = []
             try:
-                rendered = table.render_flat(_table_cells(obj, tol, lost))
+                rendered = table.render_flat(_table_cells(obj, tol, lost, chars))
             except Exception:
                 grid = [[(c or "") for c in row] for row in obj.extract()]
                 rendered = table.render(table.from_grid(grid))

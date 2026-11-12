@@ -9,6 +9,7 @@ from .table import Cell
 
 SNAP_X = 6.0   # 이보다 가까운 세로선은 같은 열 경계로 본다 (셀 안쪽 여백 칸 제거)
 SNAP_Y = 2.0
+_NUMBER = re.compile(r"^[△▽\-+(]?\d{1,3}(,\d{3})+(\.\d+)?[%)]?$")
 _CID = re.compile(r"\(cid:\d+\)")  # 글꼴에 문자 정보가 없어 읽을 수 없는 글자
 
 EMPTY_NOTE = (
@@ -110,6 +111,7 @@ def _cell_texts(tbl, chars, tol):
     from bisect import bisect_right
 
     from pdfplumber.utils import extract_text
+    from pdfplumber.utils.text import extract_words
 
     boxes = sorted(set(tbl.cells), key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
     xs = sorted({v for b in boxes for v in (b[0], b[2])})
@@ -121,17 +123,40 @@ def _cell_texts(tbl, chars, tol):
         for i in range(xi[b[0]], xi[b[2]]):
             for j in range(yi[b[1]], yi[b[3]]):
                 slot[(i, j)] = b
-    groups = {}
+    def cell_at(obj):
+        cx = (obj["x0"] + obj["x1"]) / 2
+        cy = (obj["top"] + obj["bottom"]) / 2
+        return slot.get((bisect_right(xs, cx) - 1, bisect_right(ys, cy) - 1))
+
     x0, top, x1, bottom = tbl.bbox
-    for ch in chars:
-        cx = (ch["x0"] + ch["x1"]) / 2
-        cy = (ch["top"] + ch["bottom"]) / 2
-        if not (x0 <= cx <= x1 and top <= cy <= bottom):
-            continue
-        b = slot.get((bisect_right(xs, cx) - 1, bisect_right(ys, cy) - 1))
+    inside = [
+        ch for ch in chars
+        if x0 <= (ch["x0"] + ch["x1"]) / 2 <= x1 and top <= (ch["top"] + ch["bottom"]) / 2 <= bottom
+    ]
+    # 금액이 칸 경계선에 걸쳐 인쇄된 경우 숫자가 두 칸으로 쪼개지지 않도록,
+    # 온전한 숫자 낱말은 낱말 중심이 놓인 칸에 통째로 넣는다
+    owner = {}
+    try:
+        for word in extract_words(inside, x_tolerance=max(tol, 3), return_chars=True):
+            b = cell_at(word)
+            if b is None:
+                continue
+            # 온전한 숫자이거나, 경계선 너머로 한두 글자만 삐져나온 낱말이면 통째로 넣는다
+            stray = sum(1 for ch in word["chars"] if cell_at(ch) is not b)
+            if stray and (_NUMBER.match(word["text"]) or stray <= 2):
+                for ch in word["chars"]:
+                    owner[id(ch)] = b
+    except Exception:
+        owner = {}
+    groups, orphans = {}, []
+    for ch in inside:
+        b = owner.get(id(ch)) or cell_at(ch)
         if b is not None:
             groups.setdefault(b, []).append(ch)
-    return {b: extract_text(cs, x_tolerance=tol).strip() for b, cs in groups.items()}
+        elif not ch["text"].isspace():
+            orphans.append(ch)
+    texts = {b: extract_text(cs, x_tolerance=tol).strip() for b, cs in groups.items()}
+    return texts, orphans, sum(1 for ch in inside if not ch["text"].isspace())
 
 
 def _merge_wrapped_rows(cells):
@@ -160,8 +185,16 @@ def _merge_wrapped_rows(cells):
     return cells
 
 
+class _Broken(Exception):
+    """선으로 찾은 칸에 들어가지 않는 글자가 많아 표 구조를 믿을 수 없다."""
+
+
 def _table_cells(tbl, tol=3, lost=None, chars=None):
-    texts = _cell_texts(tbl, chars, tol) if chars is not None else None
+    texts = None
+    if chars is not None:
+        texts, orphans, total = _cell_texts(tbl, chars, tol)
+        if len(orphans) > max(3, total * 0.03):
+            raise _Broken()
     fallback = tbl.extract(x_tolerance=tol) if texts is None else None
     raw = []
     for r, row in enumerate(tbl.rows):
@@ -193,6 +226,30 @@ def _table_cells(tbl, tol=3, lost=None, chars=None):
 
 # ---------------------------------------------------------------- 쪽 변환
 
+def _region_fallback(page, bbox, tol, lost):
+    """세로선이 없는 표: 글자 정렬로 칸을 추정하고, 그것도 글자를 놓치면 줄글로 내보낸다."""
+    region = page.within_bbox(bbox, strict=False)
+    lines = [_CID.subn("", ln["text"]) for ln in region.extract_text_lines(x_tolerance=tol)]
+    lost[0] += sum(n for _, n in lines)
+    plain = "\n".join(t.strip() for t, _ in lines if t.strip())
+    want = len(re.sub(r"\s", "", plain))
+    try:
+        grid = region.extract_table({
+            "vertical_strategy": "text", "horizontal_strategy": "text",
+            "text_x_tolerance": tol, "intersection_tolerance": 5,
+        }) or []
+        grid = [[_CID.sub("", c or "") for c in row] for row in grid]
+        got = len(re.sub(r"\s", "", "".join("".join(r) for r in grid)))
+        cols = max((sum(1 for c in r if c.strip()) for r in grid), default=0)
+        if grid and cols >= 2 and got >= want * 0.98:
+            rendered = table.render_flat(table.from_grid(grid))
+            if rendered:
+                return rendered
+    except Exception:
+        pass
+    return plain.replace("\n", "  \n")
+
+
 def _drop_nested(tables):
     """다른 표의 영역 안에 완전히 들어 있는 표(칸 안 글상자가 표로 잡힌 것)를 뺀다."""
     def inside(a, b):
@@ -208,13 +265,26 @@ def _drop_nested(tables):
 def _page_blocks(page):
     page, rotated = _upright_page(page)
     tol = 1.5 if rotated else 3
+    lost = [0]
     try:
-        tables = page.find_tables({"text_x_tolerance": tol})
+        tables = _drop_nested(page.find_tables({"text_x_tolerance": tol}))
     except Exception:
         tables = []
-    tables = _drop_nested(tables)
-    boxes = [t.bbox for t in tables]
     chars = page.chars if tables else None
+    prepared = []  # (영역, 변환된 글)
+    for t in tables:
+        bbox = t.bbox
+        try:
+            rendered = table.render_flat(_table_cells(t, tol, lost, chars))
+        except _Broken:
+            # 표 영역이 실제보다 좁게 잡히는 일이 많아 같은 높이의 쪽 전체 너비를 본다
+            bbox = (page.bbox[0], t.bbox[1], page.bbox[2], t.bbox[3])
+            rendered = _region_fallback(page, bbox, tol, lost)
+        except Exception:
+            grid = [[(c or "") for c in row] for row in t.extract()]
+            rendered = table.render(table.from_grid(grid))
+        prepared.append((bbox, rendered))
+    boxes = [b for b, _ in prepared]
 
     def outside(obj):
         if "x0" not in obj or "top" not in obj:
@@ -227,24 +297,18 @@ def _page_blocks(page):
     items = []
     for line in text_page.extract_text_lines(x_tolerance=tol):
         items.append((line["top"], "text", line))
-    for t in tables:
-        items.append((t.bbox[1], "table", t))
+    for bbox, rendered in prepared:
+        items.append((bbox[1], "table", rendered))
     items.sort(key=lambda x: x[0])
 
     blocks, para, last_bottom = [], [], None
-    lost = [0]
     for _, kind, obj in items:
         if kind == "table":
             if para:
                 blocks.append("\n".join(para))
                 para = []
-            try:
-                rendered = table.render_flat(_table_cells(obj, tol, lost, chars))
-            except Exception:
-                grid = [[(c or "") for c in row] for row in obj.extract()]
-                rendered = table.render(table.from_grid(grid))
-            if rendered:
-                blocks.append(rendered)
+            if obj:
+                blocks.append(obj)
             last_bottom = None
             continue
         text, n = _CID.subn("", obj["text"])

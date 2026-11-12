@@ -8,7 +8,7 @@ import os
 import sys
 import traceback
 
-from . import __version__, engine
+from . import engine, version_label
 from .engine import APP_NAME, SUPPORTED
 
 
@@ -61,7 +61,7 @@ def main(argv=None):
         _message_box(
             "변환할 파일을 마우스 오른쪽 버튼으로 누른 뒤\n"
             "'마크다운(MD)으로 변환'을 선택하세요.\n\n"
-            "지원 형식: " + ", ".join(e[1:] for e in SUPPORTED) + f"\n\nToMD v{__version__}"
+            "지원 형식: " + ", ".join(e[1:] for e in SUPPORTED) + f"\n\nToMD {version_label()}"
         )
         return 0
     engine.enqueue([os.path.abspath(a) for a in args])

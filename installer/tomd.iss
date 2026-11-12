@@ -24,6 +24,12 @@ ArchitecturesInstallIn64BitMode=x64compatible
 [Files]
 Source: "..\dist\tomd\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
+[INI]
+Filename: "{app}\version.ini"; Section: "tomd"; Key: "version"; String: "{#AppVersion}"
+
+[UninstallDelete]
+Type: files; Name: "{app}\version.ini"
+
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "마크다운(MD)으로 변환"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"

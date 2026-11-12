@@ -12,9 +12,9 @@ def run(engine):
 
     root = tk.Tk()
     root.withdraw()
-    from . import __version__
+    from . import version_label
 
-    root.title(f"ToMD v{__version__} - 마크다운 변환")
+    root.title(f"ToMD {version_label()} - 마크다운 변환")
     root.resizable(False, False)
     font = ("맑은 고딕", 10)
 

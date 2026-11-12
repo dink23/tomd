@@ -144,7 +144,10 @@ def _align_small_glyphs(chars):
             continue
         if prev is not None and abs(ch["top"] - prev["top"]) > 0.5:
             overlap = min(ch["bottom"], prev["bottom"]) - max(ch["top"], prev["top"])
-            adjacent = -0.5 * prev["height"] <= ch["x0"] - prev["x1"] <= 0.6 * prev["height"]
+            adjacent = (
+                ch["x0"] - prev["x1"] <= 0.6 * prev["height"]
+                and ch["x0"] >= prev["x0"] - 0.5 * prev["height"]
+            )
             if adjacent and overlap >= 0.6 * min(ch["height"], prev["height"]):
                 ch = dict(ch)
                 shift = prev["top"] - ch["top"]
@@ -153,7 +156,11 @@ def _align_small_glyphs(chars):
                 if "doctop" in ch:
                     ch["doctop"] += shift
                 out.append(ch)
-                continue  # 맞춘 글자는 기준으로 삼지 않는다
+                # 줄 높이는 원래 기준 글자의 것을 유지하되, 이어지는 글자가 계속 맞춰지도록 오른쪽 끝만 옮긴다
+                prev = dict(prev)
+                prev["x1"] = max(prev["x1"], ch["x1"])
+                prev["x0"] = ch["x0"]
+                continue
         out.append(ch)
         prev = ch
     return out

@@ -44,8 +44,123 @@ def _mapped(page, objects, bbox=None):
     return Mapped(page)
 
 
+def _near(a, b):
+    return (
+        abs(a["x0"] - b["x0"]) < 0.3 * max(a["width"], 1)
+        and abs(a["top"] - b["top"]) < 0.3 * max(a["height"], 1)
+    )
+
+
+def _dedupe_chars(chars):
+    """그림자·윤곽·굵게 효과로 같은 글자가 여러 번 겹쳐 찍힌 것을 한 번만 남긴다.
+
+    사본은 직전 사본에서 아주 조금씩만 어긋나므로, 같은 글자가 거의 같은 자리(글자 크기의 30% 이내)에
+    다시 나올 때만 사본으로 본다. 좁게 붙여 쓴 같은 글자(100.0%의 0 두 개)는 절반 넘게 떨어져
+    있어 지워지지 않는다.
+    """
+    # 1) 서로 다른 글이 같은 자리에 겹쳐 찍힌 경우(쪽 번호가 두 개 찍힌 오류 등): 뒤의 것을 아래 줄로 내린다
+    runs, current, prev = [], [], None
+    for ch in chars:
+        if not ch["text"].isspace():
+            if prev is not None and (
+                ch["x0"] < prev["x0"] - 0.5 * max(prev["width"], 1)
+                or abs(ch["top"] - prev["top"]) > 0.5 * max(prev["height"], 1)
+            ):
+                runs.append(current)
+                current = []
+            prev = ch
+        current.append(ch)
+    runs.append(current)
+    grid, shifted = {}, []
+    cell = lambda c: (int(c["x0"] // 4), int(c["top"] // 4))
+    for run in runs:
+        solid = [c for c in run if not c["text"].isspace()]
+        clash, bottom = False, 0.0
+        if len(solid) >= 3:
+            same = 0
+            for c in solid:
+                gx, gy = cell(c)
+                for key in ((gx + i, gy + j) for i in (-1, 0, 1) for j in (-1, 0, 1)):
+                    for other in grid.get(key, ()):
+                        if _near(c, other):
+                            if other["text"] == c["text"]:
+                                same += 1
+                            else:
+                                clash = True
+                                bottom = max(bottom, other["bottom"])
+            # 대부분 같은 글자인데 일부만 다르면 다른 글이 겹친 것이다 (그림자 사본은 전부 같다)
+            clash = clash and same >= 1
+        if clash:
+            shift = bottom - min(c["top"] for c in solid) + 1
+            moved = []
+            for c in run:
+                c = dict(c)
+                for k in ("top", "bottom", "doctop"):
+                    if k in c:
+                        c[k] += shift
+                for k in ("y0", "y1"):
+                    if k in c:
+                        c[k] -= shift
+                moved.append(c)
+            run = moved
+        for c in run:
+            if not c["text"].isspace():
+                grid.setdefault(cell(c), []).append(c)
+        shifted.extend(run)
+
+    # 2) 같은 글자가 거의 같은 자리에 다시 찍힌 사본을 지운다
+    trails, out, prev = {}, [], None
+    for ch in shifted:
+        if ch["text"].isspace():
+            out.append(ch)
+            continue
+        # 같은 줄에서 바로 앞 글자에 이어 일정하게 나아가며 찍힌 같은 글자(목차의 점선 등)는 사본이 아니다
+        advancing = (
+            prev is not None and prev["text"] == ch["text"]
+            and abs(ch["top"] - prev["top"]) < 0.01 and ch["x0"] - prev["x0"] >= 0.75
+        )
+        prev = ch
+        copy = False
+        for trail in trails.setdefault(ch["text"], []):
+            if _near(ch, trail):
+                if advancing:
+                    break
+                trail["x0"], trail["top"] = ch["x0"], ch["top"]
+                copy = True
+                break
+        if copy:
+            continue
+        trails[ch["text"]].append({"x0": ch["x0"], "top": ch["top"], "width": ch["width"], "height": ch["height"]})
+        out.append(ch)
+    return out
+
+
+def _align_small_glyphs(chars):
+    """가운뎃점·위첨자처럼 기준선이 다른 글자가 제 줄에서 떨어져 나가지 않도록 앞 글자의 줄에 맞춘다."""
+    out, prev = [], None
+    for ch in chars:
+        if ch["text"].isspace():
+            out.append(ch)
+            continue
+        if prev is not None and abs(ch["top"] - prev["top"]) > 0.5:
+            overlap = min(ch["bottom"], prev["bottom"]) - max(ch["top"], prev["top"])
+            adjacent = -0.5 * prev["height"] <= ch["x0"] - prev["x1"] <= 0.6 * prev["height"]
+            if adjacent and overlap >= 0.6 * min(ch["height"], prev["height"]):
+                ch = dict(ch)
+                shift = prev["top"] - ch["top"]
+                ch["top"], ch["bottom"] = prev["top"], prev["bottom"]
+                ch["height"] = ch["bottom"] - ch["top"]
+                if "doctop" in ch:
+                    ch["doctop"] += shift
+                out.append(ch)
+                continue  # 맞춘 글자는 기준으로 삼지 않는다
+        out.append(ch)
+        prev = ch
+    return out
+
+
 def _clean_page(page):
-    """쪽 밖에 놓인 도형을 버리고, 그림자·윤곽 효과로 여러 번 겹쳐 찍힌 글자를 하나로 줄인다."""
+    """쪽 밖에 놓인 도형과 글을 버리고, 겹쳐 찍힌 글자와 줄에서 떨어진 작은 글자를 정리한다."""
     x0, top, x1, bottom = page.bbox
     objects, changed = {}, False
     for kind, items in page.objects.items():
@@ -54,19 +169,9 @@ def _clean_page(page):
             if not ("x0" in o and (o["x1"] < x0 or o["x0"] > x1 or o["bottom"] < top or o["top"] > bottom))
         ]
         if kind == "char":
-            seen, unique = {}, []
-            for ch in kept:
-                key = (ch["text"], ch.get("fontname"), round(ch.get("size", 0), 1))
-                near = False
-                for px, pt in seen.get(key, ()):
-                    if abs(ch["x0"] - px) < 0.6 * max(ch["width"], 1) and abs(ch["top"] - pt) < 0.6 * max(ch["height"], 1):
-                        near = True
-                        break
-                if near and not ch["text"].isspace():
-                    continue
-                seen.setdefault(key, []).append((ch["x0"], ch["top"]))
-                unique.append(ch)
-            kept = unique
+            cleaned = _dedupe_chars(_align_small_glyphs(kept))
+            changed = changed or len(cleaned) != len(kept) or any(a is not b for a, b in zip(cleaned, kept))
+            kept = cleaned
         changed = changed or len(kept) != len(items)
         objects[kind] = kept
     return _mapped(page, objects) if changed else page
@@ -195,16 +300,25 @@ def _rotated_page(page, clockwise):
 def _upright_page(page):
     chars = page.chars
     if len(chars) < 20:
-        return page, False
+        return page, False, []
     sideways = [c for c in chars if not c.get("upright", True)]
     if len(sideways) < len(chars) * 0.6:
-        return page, False
+        return page, False, []
+    # 누운 쪽에서 혼자 바로 서 있는 글(쪽 번호 등)은 돌리기 전에 따로 읽어 둔다
+    try:
+        extra = [
+            ln["text"].strip()
+            for ln in page.filter(lambda o: o.get("upright", True)).extract_text_lines()
+            if ln["text"].strip()
+        ]
+    except Exception:
+        extra = []
     up = sum(1 for c in sideways if (c.get("matrix") or (0, 1))[1] > 0)
     rotated = _rotated_page(page, clockwise=up >= len(sideways) / 2)
     # 누운 글자에 딸린 공백 문자는 위치가 부정확해 숫자를 쪼개므로 버리고, 간격으로 단어를 나눈다
     return rotated.filter(
         lambda o: o.get("upright", True) and not (o.get("text") or "x").isspace()
-    ), True
+    ), True, extra
 
 
 # ---------------------------------------------------------------- 표
@@ -290,13 +404,43 @@ def _cell_texts(tbl, chars, tol, ytol=3):
                             owner[id(ch)] = b
     except Exception:
         owner = {}
-    groups, orphans = {}, []
+    groups, orphans, cell_of = {}, [], {}
     for ch in inside:
         b = owner.get(id(ch)) or cell_at(ch)
         if b is not None:
             groups.setdefault(b, []).append(ch)
+            cell_of[id(ch)] = b
         elif not ch["text"].isspace():
             orphans.append(ch)
+    # 표 테두리 밖으로 내어 쓴 글(행 이름, 제목 앞의 □ 등)은 같은 줄의 가장 가까운 칸에 넣는다
+    claimed = set()
+    inside_ids = {id(ch) for ch in inside}
+    beside = [
+        ch for ch in chars
+        if id(ch) not in inside_ids and not ch["text"].isspace()
+        and top <= (ch["top"] + ch["bottom"]) / 2 <= bottom
+    ]
+    if beside:
+        anchors = [ch for ch in inside if id(ch) in cell_of and not ch["text"].isspace()]
+        left = sorted((c for c in beside if c["x1"] <= x0 + c["width"]), key=lambda c: -c["x1"])
+        right = sorted((c for c in beside if c["x0"] >= x1 - c["width"]), key=lambda c: c["x0"])
+        for side, group in (("left", left), ("right", right)):
+            for ch in group:
+                cy = (ch["top"] + ch["bottom"]) / 2
+                reach = 1.5 * max(ch["height"], 1)
+                best = None
+                for a in anchors:
+                    if not (a["top"] <= cy <= a["bottom"]):
+                        continue
+                    gap = a["x0"] - ch["x1"] if side == "left" else ch["x0"] - a["x1"]
+                    if -0.5 * ch["width"] <= gap <= reach and (best is None or gap < best[0]):
+                        best = (gap, a)
+                if best is not None:
+                    b = cell_of[id(best[1])]
+                    groups[b].append(ch)
+                    cell_of[id(ch)] = b
+                    claimed.add(id(ch))
+                    anchors.append(ch)
     def cell_text(cs):
         # 글자가 작은 칸은 줄 간격도 좁으므로, 줄을 가르는 허용치를 글자 크기에 맞춘다
         heights = sorted(c["bottom"] - c["top"] for c in cs)
@@ -312,20 +456,23 @@ def _cell_texts(tbl, chars, tol, ytol=3):
     # 낱말이 표 영역의 좌우 경계에 걸쳐 있으면 표 영역이 실제보다 좁게 잡힌 것이다
     if not sprawling:
         mid = lambda ch: (ch["x0"] + ch["x1"]) / 2
-        band = [ch for ch in chars if top <= (ch["top"] + ch["bottom"]) / 2 <= bottom]
+        band = [
+            ch for ch in chars
+            if top <= (ch["top"] + ch["bottom"]) / 2 <= bottom and id(ch) not in claimed
+        ]
         if len(band) > len(inside) and len(xs) <= 2:
             sprawling = True  # 한 칸짜리 표 옆에 다른 글이 있으면 표의 일부만 잡힌 것이다
         elif len(band) > len(inside):
             try:
                 for word in extract_words(band, x_tolerance=tol, y_tolerance=ytol, return_chars=True):
-                    sides = {x0 <= mid(ch) <= x1 for ch in word["chars"]}
+                    sides = {x0 <= mid(ch) <= x1 or id(ch) in claimed for ch in word["chars"]}
                     if len(sides) == 2:
                         sprawling = True
                         break
             except Exception:
                 pass
     total = sum(1 for ch in inside if not ch["text"].isspace())
-    return texts, orphans, total, sprawling
+    return texts, orphans, total, sprawling, claimed
 
 
 def _merge_wrapped_rows(cells):
@@ -358,12 +505,14 @@ class _Broken(Exception):
     """선으로 찾은 칸에 들어가지 않는 글자가 많아 표 구조를 믿을 수 없다."""
 
 
-def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3):
+def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None):
     raw = []
     if chars is not None:
-        texts, orphans, total, sprawling = _cell_texts(tbl, chars, tol, ytol)
+        texts, orphans, total, sprawling, taken = _cell_texts(tbl, chars, tol, ytol)
         if sprawling or len(orphans) > max(3, total * 0.03):
             raise _Broken()
+        if claimed is not None:
+            claimed.update(taken)
         for bbox in set(tbl.cells) | set(texts):
             text, n = _CID.subn("", texts.get(bbox, ""))
             if lost is not None:
@@ -399,7 +548,15 @@ def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3):
 
 def _region_fallback(page, bbox, tol, lost, ytol=3):
     """세로선이 없는 표: 글자 정렬로 칸을 추정하고, 그것도 글자를 놓치면 줄글로 내보낸다."""
-    region = page.within_bbox(bbox, strict=False)
+    def centered(obj):
+        if "x0" not in obj or "top" not in obj:
+            return False
+        cx = (obj["x0"] + obj["x1"]) / 2
+        cy = (obj["top"] + obj["bottom"]) / 2
+        return bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]
+
+    # 표 밖 글을 고를 때와 같은 기준(중심점)으로 골라야 경계에 걸친 글자가 빠지지 않는다
+    region = page.filter(centered)
     lines = [
         _CID.subn("", ln["text"])
         for ln in region.extract_text_lines(x_tolerance=tol, y_tolerance=ytol)
@@ -417,7 +574,7 @@ def _region_fallback(page, bbox, tol, lost, ytol=3):
         cols = max((sum(1 for c in r if c.strip()) for r in grid), default=0)
         amounts = lambda t: sorted(re.findall(r"\d{1,3}(?:,\d{3})+", t))
         whole = amounts(plain) == amounts(" | ".join(" | ".join(r) for r in grid))
-        if grid and cols >= 2 and got >= want * 0.98 and whole:
+        if grid and cols >= 2 and got >= want and whole:
             rendered = table.render_flat(table.from_grid(grid))
             if rendered:
                 return rendered
@@ -439,7 +596,7 @@ def _drop_nested(tables):
 
 
 def _page_blocks(page, shifts=None):
-    page, rotated = _upright_page(_clean_page(page))
+    page, rotated, extra = _upright_page(_clean_page(page))
     tol = 1.5 if rotated else 3
     lost = [0]
     heights = sorted(c["bottom"] - c["top"] for c in page.chars) or [10]
@@ -452,10 +609,11 @@ def _page_blocks(page, shifts=None):
         tables = []
     chars = page.chars if tables else None
     prepared = []  # (영역, 변환된 글)
+    claimed = set()  # 표 밖에 있지만 표의 칸으로 가져간 글자
     for t in tables:
         bbox = t.bbox
         try:
-            rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol))
+            rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol, claimed))
         except _Broken:
             # 표 영역이 실제보다 좁게 잡히는 일이 많아 같은 높이의 쪽 전체 너비를 본다
             bbox = (page.bbox[0], t.bbox[1], page.bbox[2], t.bbox[3])
@@ -469,6 +627,8 @@ def _page_blocks(page, shifts=None):
     def outside(obj):
         if "x0" not in obj or "top" not in obj:
             return True
+        if id(obj) in claimed:
+            return False
         cx = (obj["x0"] + obj["x1"]) / 2
         cy = (obj["top"] + obj["bottom"]) / 2
         return not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
@@ -504,6 +664,8 @@ def _page_blocks(page, shifts=None):
         last_bottom = obj["bottom"]
     if para:
         blocks.append("\n".join(para))
+    if extra:
+        blocks.append("\n".join(_CID.sub("", line) for line in extra))
     if lost[0]:
         blocks.insert(0, f"> 이 쪽에는 글꼴에 문자 정보가 없어 읽지 못한 글자가 {lost[0]}개 있습니다. 원본을 확인하세요.")
     if restored:

@@ -329,6 +329,8 @@ def _keep_stream_order(chars):
 _SYMBOL_GLYPHS = {0xF0B7: "•", 0xF0A7: "▪", 0xF06C: "●", 0xF06E: "■", 0xF071: "□", 0xF0A8: "◦",
                   0xF0D8: "➢", 0xF0FC: "✓", 0xF076: "❖", 0xF0E0: "→", 0xF0E8: "➔", 0xF0A1: "○"}
 _NOTE_START = ("(", "（", "※", "*", "<", "〈", "[")
+_HEAD = "\x03"  # 큰 글자 덩어리 표시: \x03크기\x03글 (assemble 에서 제목인지 가린다)
+_STATS = "\x04"  # 쪽의 글자 크기 분포 (assemble 에서 본문 크기를 정한다)
 _MARGIN = "\x02"  # 쪽 가장자리 줄 표시 (assemble 에서 머리말·꼬리말인지 가린다)
 _BULLET_LINE = re.compile(r"^(•)\s*(.*)$")  # □ ○ ◦ - 같은 한국 문서의 단계 기호는 그대로 둔다
 
@@ -1176,6 +1178,22 @@ def _drop_nested(tables):
     return keep
 
 
+def _line_size(line):
+    sizes = sorted(round(c.get("size", 0) * 2) / 2 for c in line.get("chars", []) if not c["text"].isspace())
+    return sizes[len(sizes) // 2] if sizes else 0
+
+
+# 제목으로 보지 않는 줄: 글머리표·안내 기호로 시작, 조사로 시작(글 조각), 문장처럼 끝남
+_NOT_HEADING_START = re.compile(r"^[-–·•○◦●※*▶▷→⇒]|^(을|를|은|는|의|에|와|과|도|로|으로)\s")
+_NOT_HEADING_END = re.compile(r"[.!,;]$|다$")
+_BOLD_FONT = re.compile(r"bold|black|heavy|semibold|demibold|extrabold|[,-]b$|-?hy?gt?b|gothic-?b\b", re.I)
+
+
+def _bold_line(line):
+    chars = [c for c in line.get("chars", []) if not c["text"].isspace()]
+    return bool(chars) and all(_BOLD_FONT.search(c.get("fontname", "")) for c in chars)
+
+
 def _page_blocks(page, shifts=None):
     page = _clean_page(page)
     original = page
@@ -1361,6 +1379,37 @@ def _page_blocks(page, shifts=None):
 
     blocks, para, last_bottom = [], [], None
     columns_at = {}  # blocks 안의 자리 -> 좌우로 나란한 묶음의 칸별 글
+    # 이 쪽 본문 글자 크기 (글자 수가 가장 많은 크기, 표 안 글자 포함)
+    stats = {}
+    for c in page.chars:
+        if not c["text"].isspace():
+            key = round(c.get("size", 0) * 2) / 2
+            stats[key] = stats.get(key, 0) + 1
+    page_body = max(stats, key=lambda k: (stats[k], -k)) if stats else 0
+
+    def head_kind(line, text=None, cont=False):
+        """제목 후보 줄이면 'big'(본문보다 확실히 큰 글자) 또는 'bold'(짧은 굵은 줄), 아니면 ''."""
+        text = (text if text is not None else line.get("text", "")).strip()
+        if not page_body or not text or len(text) > 60 or _BULLET_LINE.match(text) or _NOT_HEADING_END.search(text) \
+                or (not cont and _NOT_HEADING_START.search(text)):
+            return ""
+        words = text.split()
+        if len(re.findall(r"[^\W\d_]", text)) < 2 or (len(words) >= 3 and all(len(w) == 1 for w in words)):
+            return ""  # 글자 하나짜리 / 한 글자씩 띄어 쓴 디자인 글자
+        if _line_size(line) >= page_body * 1.25:
+            return "big"
+        if len(text) <= 40 and _bold_line(line) and not re.search(r"[?。]$|[음함임됨]$", text) and _line_size(line) >= page_body * 0.85:
+            return "bold"
+        return ""
+
+    def heading_block(kind, lines):
+        text = "\n".join(t for t, _ in lines)
+        if (kind and len(lines) <= (2 if kind == "big" else 1) and len(text) <= 80
+                and re.search(r"[^\W\d_]", text)):
+            bold = "b" if kind == "bold" else ""
+            size = min(_line_size(ln) for _, ln in lines)
+            return f"{_HEAD}{size}{bold}{_HEAD}" + text.replace("\n", " ")
+        return text
 
     def flush():
         if not para:
@@ -1397,7 +1446,22 @@ def _page_blocks(page, shifts=None):
                 else:
                     blocks.append(text)
             else:
-                blocks.append("\n".join(t for t, _ in para))
+                # 제목 후보 줄과 본문 줄, 굵은 제목 줄끼리는 서로 다른 덩어리로 나눈다
+                runs = []
+                for t, ln in para:
+                    kind = ln.get("_kind", "")
+                    if runs and runs[-1][0] == kind and kind != "bold":
+                        runs[-1][1].append((t, ln))
+                    else:
+                        runs.append((kind, [(t, ln)]))
+                pieces = []
+                for kind, lines in runs:
+                    piece = heading_block(kind, lines)
+                    if pieces and not piece.startswith(_HEAD) and not pieces[-1].startswith(_HEAD):
+                        pieces[-1] += "\n" + piece  # 제목이 못 된 줄은 원래 문단에 그대로 둔다
+                    else:
+                        pieces.append(piece)
+                blocks.extend(pieces)
         para.clear()
 
     last_region = None
@@ -1421,6 +1485,15 @@ def _page_blocks(page, shifts=None):
         height = max(obj["bottom"] - obj["top"], 1)
         if para and last_bottom is not None and obj["top"] - last_bottom > height * 0.8:
             flush()
+        prev = para[-1][1] if para else None
+        same = prev is not None and abs(_line_size(prev) - _line_size(obj)) < 0.5 and _bold_line(prev) == _bold_line(obj)
+        if same and prev.get("_kind") == "big":
+            kind = head_kind(obj, text, cont=True)  # 두 줄로 된 큰 제목의 둘째 줄
+        elif same and not prev.get("_kind"):
+            kind = ""  # 제목이 아닌 같은 모양 줄에 이어지는 줄이다
+        else:
+            kind = head_kind(obj, text)
+        obj["_kind"] = kind
         bullet = _BULLET_LINE.match(text)
         if bullet:
             text = "\x01" + bullet.group(2)  # 글머리표 줄 (flush 에서 목록으로 바꾼다)
@@ -1464,6 +1537,8 @@ def _page_blocks(page, shifts=None):
     blocks = [_MARGIN + t for t in heads] + blocks + [_MARGIN + t for t in feet]
     if extra:
         blocks.append("\n".join(_CID.sub("", line) for line in extra))
+    if stats:
+        blocks.append(_STATS + ";".join(f"{k}={v}" for k, v in sorted(stats.items())))
     if lost[0]:
         blocks.insert(0, f"> 이 쪽에는 글꼴에 문자 정보가 없어 읽지 못한 글자가 {lost[0]}개 있습니다. 원본을 확인하세요.")
     if restored:
@@ -1515,15 +1590,49 @@ def _continues(prev, nxt):
     return len(following) >= 2
 
 
+def _md_heading(text):
+    # 제목 줄 앞뒤의 '#'·공백이 마크다운 문법과 부딪히지 않게 한다
+    return re.sub(r"\s+", " ", text).strip().rstrip("#").strip() or text
+
+
 def assemble(parts, total):
     """convert_range 결과들을 하나의 본문으로 합친다.
 
     여러 쪽에 되풀이되는 머리말·꼬리말(쪽 번호만 다른 것 포함)은 빼고, 쪽 경계에서 끊긴 문단은 앞 쪽에 잇는다.
     """
     pages = []
+    stats = {}
+    heads = {}  # id(덩어리) -> 글자 크기 (제목 후보)
     for number, text in sorted(parts):
-        blocks = [b for b in (text or "").split("\n\n") if b.strip()]
+        blocks = []
+        for b in (text or "").split("\n\n"):
+            if not b.strip():
+                continue
+            if b.startswith(_STATS):
+                for pair in b[1:].split(";"):
+                    k, _, v = pair.partition("=")
+                    try:
+                        stats[float(k)] = stats.get(float(k), 0) + int(v)
+                    except ValueError:
+                        pass
+                continue
+            if b.startswith(_HEAD):
+                size, _, b = b[1:].partition(_HEAD)
+                try:
+                    heads[id(b)] = (float(size.rstrip("b")), size.endswith("b"))
+                except ValueError:
+                    pass
+            blocks.append(b)
         pages.append([number, blocks])
+    # 문서 전체에서 글자 수가 가장 많은 크기를 본문 크기로 보고, 그보다 25% 이상 큰 짧은 덩어리를 제목으로 둔다
+    body_size = max(stats, key=lambda k: (stats[k], -k)) if stats else 0
+    # 큰 글자는 크기 순서대로 단계를 나누고, 본문 크기의 굵은 짧은 줄은 그 아래 단계로 둔다
+    tiers = sorted({s for s, bold in heads.values() if body_size and s >= body_size * 1.25}, reverse=True)
+    base = 3 if total > 1 else 2  # 여러 쪽이면 '## N쪽' 아래에 둔다
+    level_of = {(s, b): min(base + i, 6) for i, s in enumerate(tiers) for b in (True, False)}
+    for s, bold in set(heads.values()):
+        if bold and (s, True) not in level_of and body_size and body_size * 0.85 <= s:
+            level_of[(s, True)] = min(base + len(tiers), 6)
     seen = {}
     for number, blocks in pages:
         for b in blocks:
@@ -1598,6 +1707,7 @@ def assemble(parts, total):
     filled = [p for p in pages if p[1]]
     for prev, nxt in zip(filled, filled[1:]):
         if (prev[1] and nxt[1] and id(prev[1][-1]) not in edge and id(nxt[1][0]) not in edge
+                and id(prev[1][-1]) not in heads and id(nxt[1][0]) not in heads
                 and _continues(prev[1][-1], nxt[1][0])):
             prev[1][-1] += "\n" + nxt[1].pop(0)
     out = []
@@ -1610,7 +1720,13 @@ def assemble(parts, total):
         if total > 1:
             # 쪽 번호를 소제목으로 둔다: 옵시디언 개요(목차)에서 쪽으로 바로 가고 [[문서#12쪽]]으로 연결할 수 있다
             out.append(f"## {number}쪽")
-        out.append("\n\n".join(blocks))
+        shown_blocks = []
+        for b in blocks:
+            key = heads.get(id(b))
+            if key in level_of:
+                b = "#" * level_of[key] + " " + _md_heading(b)
+            shown_blocks.append(b)
+        out.append("\n\n".join(shown_blocks))
     if not out or (repeated and len(out) == 1):
         return EMPTY_NOTE
     return "\n\n".join(out)

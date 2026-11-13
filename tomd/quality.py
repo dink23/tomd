@@ -58,7 +58,9 @@ def check(path, kind, body, parts=None, total=None):
         warnings += _pdf(parts, total or len(parts))
     if kind in ("xlsx", "xlsm"):
         warnings += _xlsx(path)
-    if kind == "pptx":
+    if re.search(r"^> 이 컴퓨터에서 (워드|파워포인트)를 쓸 수 없어", body, flags=re.M):
+        warnings.append("오피스 프로그램 없이 글자만 꺼냈습니다. 표·목록·서식이 원본과 다를 수 있습니다.")
+    if kind in ("pptx", "ppt"):
         sections = re.split(r"^## 슬라이드 ", body, flags=re.M)[1:]
         only_pictures = 0
         for sec in sections:

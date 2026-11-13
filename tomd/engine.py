@@ -15,7 +15,7 @@ BIG_PDF_PAGES = 40            # 이 쪽수 이상인 PDF는 여러 프로세스�
 BIG_FILE_BYTES = 3_000_000    # 이보다 큰 다른 문서도 별도 프로세스에서
 BATCH_FILES = 4               # 한 번에 이보다 많은 파일이면 여러 프로세스로 동시에
 BIG_FOLDER_FILES = 300        # 폴더 안 문서가 이보다 많으면 변환 전에 물어본다
-SUPPORTED = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".docx", ".pptx", ".odt", ".html", ".htm", ".txt")
+SUPPORTED = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".docx", ".doc", ".pptx", ".ppt", ".odt", ".html", ".htm", ".txt")
 STALE_SECONDS = 600
 
 
@@ -123,7 +123,7 @@ class Lock:
 # ---------------------------------------------------------------- 작업 (별도 프로세스에서 실행)
 
 def _convert_whole(path):
-    from . import hangul, odf, office, web
+    from . import hangul, legacy, odf, office, web
 
     funcs = {
         ".odt": odf.convert_odt,
@@ -139,6 +139,8 @@ def _convert_whole(path):
         ".txt": office.convert_txt,
         ".docx": office.convert_docx,
         ".pptx": office.convert_pptx,
+        ".doc": legacy.convert_doc,
+        ".ppt": legacy.convert_ppt,
     }
     return funcs[Path(path).suffix.lower()](path)
 
@@ -177,7 +179,7 @@ def document(source, body, pages=None, extra=None):
     meta = [("title", source.stem), ("source", source.name), ("type", kind)]
     if pages:
         meta.append(("pages", pages))
-    if kind == "pptx":
+    if kind in ("pptx", "ppt"):
         meta.append(("slides", len(re.findall(r"^## 슬라이드 \d+", body, flags=re.M))))
     elif kind in ("xlsx", "xlsm", "xls"):
         sheets = len(re.findall(r"^## (?!매크로\(VBA\)$)", body, flags=re.M))

@@ -147,28 +147,44 @@ def collect_meta(source, cli_meta=None, levels=6):
 
 # ---------------------------------------------------------------- 기존 변환본 머리말 읽기
 
-def read_front_matter(md_path, limit=80):
-    """md 첫머리의 YAML 머리말에서 'key: 값' 줄만 읽는다 (목록은 무시)."""
+def read_front_matter(md_path, limit=200):
+    """md 첫머리의 YAML 머리말에서 'key: 값' 줄과 간단한 목록('key:' 다음 '  - 값' 줄들)을 읽는다."""
     out = {}
+
+    def value(raw):
+        raw = raw.strip()
+        if raw.startswith('"'):
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return raw.strip('"')
+        return raw
+
     try:
         with open(md_path, encoding="utf-8") as f:
-            first = f.readline()
-            if first.strip() != "---":
+            if f.readline().strip() != "---":
                 return out
+            current = None
             for _ in range(limit):
                 line = f.readline()
                 if not line or line.strip() == "---":
                     break
-                m = re.match(r"^([A-Za-z_가-힣][\w가-힣]*):\s*(.*)$", line.rstrip("\n"))
+                line = line.rstrip("\n")
+                item = re.match(r"^\s+-\s+(.*)$", line)
+                if item and current is not None:
+                    out[current].append(value(item.group(1)))
+                    continue
+                m = re.match(r"^([A-Za-z_가-힣][\w가-힣]*):\s*(.*)$", line)
                 if not m:
+                    current = None
                     continue
                 key, raw = m.group(1), m.group(2).strip()
-                if raw.startswith('"'):
-                    try:
-                        raw = json.loads(raw)
-                    except ValueError:
-                        raw = raw.strip('"')
-                out[key] = raw
+                if raw == "":
+                    out[key], current = [], key
+                elif raw == "[]":
+                    out[key], current = [], None
+                else:
+                    out[key], current = value(raw), None
     except OSError:
         pass
     return out

@@ -265,6 +265,35 @@ class _Job:
 IF_EXISTS = ("new", "skip", "overwrite", "always")
 
 
+def _same_meta(front, meta, explicit_id):
+    """기존 변환본의 메타데이터가 지금 지정한 값과 같은가 (tomd-meta.json·--meta 를 바꿨으면 다시 변환한다)."""
+    from .catalog import RESERVED, STANDARD
+
+    def text(v):
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (list, tuple)):
+            return [text(x) for x in v]
+        return str(v)
+
+    # 예전 변환본에만 있던 사용자 항목(지정에서 지운 항목)도 비교한다
+    own = RESERVED | set(STANDARD) | {"doc_id", "review", "id_candidates"}
+    keys = set(STANDARD) | set(meta) | {k for k in front if k not in own}
+    for key in keys:
+        old = front.get(key)
+        if isinstance(old, list):
+            old = [str(x) for x in old]
+        elif old is None or old == []:
+            old = ""
+        if old != text(meta.get(key)):
+            return False
+    if explicit_id and front.get("doc_id") != str(explicit_id):
+        return False
+    return True
+
+
 class Engine(threading.Thread):
     """대기열을 비울 때까지 변환한다. snapshot()으로 진행 상황을 읽는다."""
 
@@ -414,12 +443,13 @@ class Engine(threading.Thread):
         fronts = [(p, catalog.read_front_matter(p)) for p in olds]
         if mode == "skip" and olds:
             return None, olds[0]
-        if mode == "new":
-            for p, fm in fronts:
-                if fm.get("content_hash") == content_hash and fm.get("converter_version") == version:
-                    return None, p
         meta, meta_warnings = catalog.collect_meta(path, self.opts.get("meta"))
         explicit = meta.pop("doc_id", None)
+        if mode == "new":
+            for p, fm in fronts:
+                if (fm.get("content_hash") == content_hash and fm.get("converter_version") == version
+                        and _same_meta(fm, meta, explicit)):
+                    return None, p
         sibling_ids = [fm.get("doc_id") for _, fm in fronts if fm.get("source") == path.name and fm.get("doc_id")]
         try:
             doc_id, id_status, candidates = self._registry_obj().resolve(path, content_hash, explicit, sibling_ids)

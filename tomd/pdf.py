@@ -914,6 +914,63 @@ def _region_fallback(page, bbox, tol, lost, ytol=3, plain_only=False):
     return plain.replace("\n", "  \n")
 
 
+def _text_columns(tbl, chars, tol, ytol):
+    """가로줄만 있는 표(세로 칸막이 없음): 모든 행에 걸쳐 비어 있는 세로 띠(글자 사이 큰 틈)로 칸을 나눈다.
+
+    한 칸짜리로 잡힌 표에서만 쓴다. 칸을 믿을 수 없으면 None.
+    """
+    from pdfplumber.utils import extract_text
+    from pdfplumber.utils.text import extract_words
+
+    x0, top, x1, bottom = tbl.bbox
+    inside = [
+        ch for ch in chars
+        if x0 <= (ch["x0"] + ch["x1"]) / 2 <= x1 and top <= (ch["top"] + ch["bottom"]) / 2 <= bottom
+    ]
+    solid = [ch for ch in inside if not ch["text"].isspace()]
+    if len(solid) < 6:
+        return None
+    widths = sorted(ch["x1"] - ch["x0"] for ch in solid)
+    gutter = max(8.0, 1.2 * widths[len(widths) // 2])
+    words = extract_words(solid, x_tolerance=tol, y_tolerance=ytol)
+    spans = sorted((w["x0"], w["x1"]) for w in words)
+    covered, cuts = [], []
+    for a, b in spans:
+        if covered and a <= covered[-1][1]:
+            covered[-1][1] = max(covered[-1][1], b)
+        else:
+            covered.append([a, b])
+    for (_, end), (start, _) in zip(covered, covered[1:]):
+        if start - end >= gutter:
+            cuts.append((end + start) / 2)
+    if not cuts or len(cuts) > 7:
+        return None
+    bounds = [x0] + cuts + [x1]
+    bands = sorted({(round(c[1], 1), round(c[3], 1)) for c in tbl.cells})
+    rows, used = [], 0
+    for k, (btop, bbottom) in enumerate(bands):
+        last = k == len(bands) - 1
+        row = []
+        for j, (left, right) in enumerate(zip(bounds, bounds[1:])):
+            edge = j == len(bounds) - 2
+            part = [
+                ch for ch in inside
+                if left <= (ch["x0"] + ch["x1"]) / 2 and ((ch["x0"] + ch["x1"]) / 2 < right or edge)
+                and btop <= (ch["top"] + ch["bottom"]) / 2 and ((ch["top"] + ch["bottom"]) / 2 < bbottom or last)
+            ]
+            used += sum(1 for ch in part if not ch["text"].isspace())
+            row.append(_CID.sub("", extract_text(part, x_tolerance=tol, y_tolerance=ytol).strip()) if part else "")
+        if any(row):
+            rows.append(row)
+    if len(rows) < 2 or used != len(solid):
+        return None  # 글자가 빠지거나 두 번 들어가면 쓰지 않는다
+    ncol = len(bounds) - 1
+    # 칸마다 절반 이상의 행에 글이 있어야 진짜 칸이다 (우연히 생긴 틈 걸러 내기)
+    if any(sum(1 for r in rows if r[c]) < 0.5 * len(rows) for c in range(ncol)):
+        return None
+    return table.from_grid(rows)
+
+
 def _drop_nested(tables):
     """다른 표의 영역 안에 완전히 들어 있는 표(칸 안 글상자가 표로 잡힌 것)를 뺀다."""
     def inside(a, b):
@@ -1015,7 +1072,13 @@ def _page_blocks(page, shifts=None):
     for t in tables:
         bbox = t.bbox
         try:
-            rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol, claimed, fills))
+            before = len(claimed)
+            cells = _table_cells(t, tol, lost, chars, ytol, claimed, fills)
+            # 표 밖에서 끌어온 글자가 있으면 칸 나누기에 그 글자가 빠지므로 하지 않는다
+            if (cells and len(claimed) == before and len(cells) >= 2
+                    and all(c.col == 0 and c.colspan == 1 for c in cells)):
+                cells = _text_columns(t, chars, tol, ytol) or cells
+            rendered = table.render_flat(cells)
         except _Broken as broken:
             # 표 영역이 실제보다 좁게 잡히는 일이 많아 같은 높이의 쪽 전체 너비를 본다
             bbox = (page.bbox[0], t.bbox[1], page.bbox[2], t.bbox[3])

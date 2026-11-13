@@ -150,12 +150,22 @@ def _convert_pdf_range(path, start, end):
 
 def _yaml(value):
     """YAML 값 하나 (문자열은 큰따옴표로 감싸 콜론·# 같은 글자도 안전하게)."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
         return str(value)
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def document(source, body, pages=None):
+def _yaml_lines(key, value):
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return [f"{key}: []"]
+        return [f"{key}:"] + [f"  - {_yaml(v)}" for v in value]
+    return [f"{key}: {_yaml(value)}"]
+
+
+def document(source, body, pages=None, extra=None):
     """변환 결과 전체: 문서 정보(YAML 머리말) + 제목 + 본문.
 
     머리말은 옵시디언의 '속성(Properties)'으로 보이고, 다른 마크다운 도구에서는 대부분 숨겨진다.
@@ -177,22 +187,37 @@ def document(source, body, pages=None):
             meta.append(("macros", macros))
     meta.append(("converted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
     meta.append(("converter", f"ToMD {version_label()}"))
-    lines = ["---"] + [f"{key}: {_yaml(value)}" for key, value in meta] + ["tags:", "  - ToMD", "---"]
+    meta += list(extra or [])  # v20: 원본 식별·메타데이터·품질 (v19 항목 뒤에 덧붙인다)
+    lines = ["---"] + [ln for key, value in meta for ln in _yaml_lines(key, value)] + ["tags:", "  - ToMD", "---"]
     return "\n".join(lines) + f"\n\n# {source.stem}\n\n{body}\n"
 
 
-def write_new(source, text):
+def write_new(source, text, folder=None):
     """기존 파일을 덮어쓰지 않고 새 .md 파일을 만든다."""
+    folder = Path(folder) if folder else source.parent
+    folder.mkdir(parents=True, exist_ok=True)
     n = 1
     while True:
         suffix = "" if n == 1 else f" ({n})"
-        target = source.with_name(f"{source.stem}{suffix}.md")
+        target = folder / f"{source.stem}{suffix}.md"
         try:
             with open(target, "x", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             return target
         except FileExistsError:
             n += 1
+
+
+def write_replace(source, text, folder=None):
+    """이름.md 를 새 내용으로 바꾼다 (--if-exists overwrite 로 명시했을 때만)."""
+    folder = Path(folder) if folder else source.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{source.stem}.md"
+    tmp = folder / f".{source.stem}.md.tomd-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, target)
+    return target
 
 
 def _chain(exc):
@@ -232,13 +257,34 @@ class _Job:
         self.futures = []   # [(future, units)]
         self.pages = None   # PDF이면 전체 쪽수
         self.counted = set()
+        self.folder = None  # 결과를 저장할 폴더
+        self.info = {}      # 원본 식별·메타데이터
+
+
+IF_EXISTS = ("new", "skip", "overwrite", "always")
 
 
 class Engine(threading.Thread):
     """대기열을 비울 때까지 변환한다. snapshot()으로 진행 상황을 읽는다."""
 
-    def __init__(self):
+    def __init__(self, options=None):
+        """options (모두 생략 가능 — 오른쪽 클릭 변환은 기본값을 쓴다):
+        paths     : 대기열 대신 이 경로들만 변환 (명령행 --input)
+        output    : 결과 폴더 (생략하면 원본 옆). 폴더를 변환하면 하위 폴더 구조를 따라 만든다
+        meta      : 명령행 --meta 값 {키: 값}
+        registry  : 문서등록 기록 파일 경로 (생략하면 %LOCALAPPDATA%\\ToMD\\registry.json, False면 쓰지 않음)
+        if_exists : new(기본: 같은 내용·같은 버전으로 이미 변환했으면 건너뛰고, 아니면 새 파일)
+                    skip(변환본이 이미 있으면 건너뜀) · overwrite(이름.md를 바꿈) · always(늘 새 파일)
+        """
         super().__init__(daemon=True)
+        self.opts = dict(options or {})
+        if self.opts.get("if_exists", "new") not in IF_EXISTS:
+            raise ValueError(f"--if-exists 값은 {', '.join(IF_EXISTS)} 중 하나입니다.")
+        self._registry = None
+        self._saved = time.time()
+        self._listing = {}   # 폴더별 기존 .md 목록 (폴더마다 한 번만 읽는다)
+        self.skipped = []    # [(파일 이름, 이미 있는 변환본)]
+        self.records = []    # 결과 JSON 보고서용
         cpu = os.cpu_count() or 2
         self.workers = max(1, min(cpu - 1, 8))
         self._pool = None    # 큰 PDF만 쓰는 작업 프로세스 묶음 (tomd.exe 복사본 여러 개)
@@ -262,8 +308,9 @@ class Engine(threading.Thread):
                 "total_units": self.total_units,
                 "done_units": self.done_units,
                 "files_total": self.files_total,
-                "files_done": len(self.outputs) + len(self.failures),
+                "files_done": len(self.outputs) + len(self.failures) + len(self.skipped),
                 "ok": len(self.outputs),
+                "skipped": list(self.skipped),
                 "failures": list(self.failures),
                 "current": self.current,
                 "finished": self.finished,
@@ -303,9 +350,10 @@ class Engine(threading.Thread):
             self._local = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tomd")
         return self._local
 
-    def _fail(self, path, exc):
+    def _fail(self, path, exc, info=None):
         with self._state_lock:
             self.failures.append((Path(path).name, reason(exc)))
+            self.records.append({"source": str(path), "result": "failed", "reason": reason(exc), **(info or {})})
         log(f"{path}: {exc!r}")
 
     def _expand(self, paths):
@@ -315,7 +363,7 @@ class Engine(threading.Thread):
                 found = 0
                 for child in iter_supported(p):
                     found += 1
-                    yield child
+                    yield child, p
                 if not found:
                     # 아무 일도 없이 끝나면 고장으로 보이므로 이유를 알린다
                     with self._state_lock:
@@ -325,9 +373,100 @@ class Engine(threading.Thread):
                         + ", ".join(e[1:] for e in SUPPORTED)
                     ))
             else:
-                yield p
+                yield p, None
 
-    def _add(self, path):
+    def _registry_obj(self):
+        if self._registry is None:
+            from . import catalog
+
+            where = self.opts.get("registry")
+            if where is False:
+                where = None
+            elif not where:
+                where = base_dir() / "registry.json"
+            self._registry = catalog.Registry(where)
+        return self._registry
+
+    def _identify(self, path, root):
+        """원본 식별(해시·doc_id)과 메타데이터. 이미 변환된 것이면 (None, 기존 변환본)."""
+        from . import catalog, version_label
+
+        version = version_label()
+        out = self.opts.get("output")
+        if root is not None:
+            rel_parent = path.parent.relative_to(root)
+            source_path = (Path(root.name) / path.relative_to(root)).as_posix()
+        else:
+            rel_parent = Path()
+            source_path = path.name
+        folder = (Path(out) / rel_parent) if out else path.parent
+        content_hash = catalog.sha256(path)
+        st = path.stat()
+        mode = self.opts.get("if_exists", "new")
+        key = os.path.normcase(str(folder))
+        if key not in self._listing:
+            try:
+                self._listing[key] = [n for n in os.listdir(folder) if n.lower().endswith(".md")]
+            except OSError:
+                self._listing[key] = []
+        olds = catalog.existing_outputs(folder, path.stem, self._listing[key])
+        fronts = [(p, catalog.read_front_matter(p)) for p in olds]
+        if mode == "skip" and olds:
+            return None, olds[0]
+        if mode == "new":
+            for p, fm in fronts:
+                if fm.get("content_hash") == content_hash and fm.get("converter_version") == version:
+                    return None, p
+        meta, meta_warnings = catalog.collect_meta(path, self.opts.get("meta"))
+        explicit = meta.pop("doc_id", None)
+        sibling_ids = [fm.get("doc_id") for _, fm in fronts if fm.get("source") == path.name and fm.get("doc_id")]
+        try:
+            doc_id, id_status, candidates = self._registry_obj().resolve(path, content_hash, explicit, sibling_ids)
+            self._registry_obj().note(doc_id, path, content_hash)
+        except Exception as exc:
+            log(f"registry: {exc!r}")
+            doc_id, id_status, candidates = str(uuid.uuid4()), "check", []
+            meta_warnings.append("문서등록 기록을 읽지 못해 새 doc_id를 만들었습니다.")
+        review = list(meta_warnings)  # 메타데이터 설정 문제는 변환 품질이 아니라 확인할 일로 둔다
+        if id_status == "check":
+            review.append(
+                f"doc_id 확인 필요: 같은 문서일 수 있는 기록 {len(candidates)}건 (자동으로 합치지 않음)"
+                if candidates else "doc_id 확인 필요"
+            )
+        missing = [key for key in catalog.STANDARD if meta.get(key) in (None, "")]
+        if missing:
+            review.append("미지정: " + ", ".join(missing))
+        info = {
+            "doc_id": doc_id, "content_hash": content_hash, "source_path": source_path,
+            "source_size": st.st_size,
+            "source_modified": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "meta": meta, "converter_version": version,
+            "id_status": id_status, "id_candidates": candidates, "review": review,
+        }
+        return info, folder
+
+    def _extra(self, info, warnings):
+        from . import catalog
+
+        meta = info["meta"]
+        extra = [(k, info[k]) for k in ("doc_id", "content_hash", "source_path", "source_size", "source_modified")]
+        extra += [(k, meta.get(k, "")) for k in catalog.STANDARD]
+        extra += [(k, v) for k, v in meta.items() if k not in catalog.STANDARD]
+        extra.append(("converter_version", info["converter_version"]))
+        extra.append(("id_status", info["id_status"]))
+        if info["id_candidates"]:
+            extra.append(("id_candidates", info["id_candidates"]))
+        if info["review"]:
+            extra.append(("review", info["review"]))
+        extra.append(("status", "warning" if warnings else "ok"))
+        if warnings:
+            extra.append(("warnings", warnings))
+        from .catalog import SCHEMA
+
+        extra.append(("tomd_schema", SCHEMA))
+        return extra
+
+    def _add(self, path, root=None):
         key = os.path.normcase(os.path.abspath(str(path)))
         if key in self._seen:
             return
@@ -350,6 +489,19 @@ class Engine(threading.Thread):
             self._fail(path, ValueError("빈 파일(0바이트)입니다."))
             return
         job = _Job(path)
+        try:
+            info, where = self._identify(path, root)
+        except Exception as exc:
+            self._fail(path, exc)
+            return
+        if info is None:
+            with self._state_lock:
+                self.skipped.append((path.name, str(where)))
+                self.records.append({"source": str(path), "result": "skipped", "output": str(where),
+                                     "reason": "같은 내용을 같은 버전으로 이미 변환했습니다."
+                                     if self.opts.get("if_exists", "new") == "new" else "변환본이 이미 있습니다."})
+            return
+        job.info, job.folder = info, where
         try:
             if ext == ".pdf":
                 from . import pdf
@@ -391,7 +543,11 @@ class Engine(threading.Thread):
             if len(job.counted) < len(job.futures):
                 continue
             self._jobs.remove(job)
+            info = job.info
             try:
+                from . import quality
+
+                parts = None
                 if job.pages is not None:
                     from . import pdf
 
@@ -400,23 +556,61 @@ class Engine(threading.Thread):
                 else:
                     body = job.futures[0][0].result()
                 body = (body or "").strip() or "> 이 파일에서 변환할 내용을 찾지 못했습니다."
-                target = write_new(job.path, document(job.path, body, job.pages))
+                kind = job.path.suffix.lower().lstrip(".")
+                try:
+                    warnings = quality.check(str(job.path), kind, body, parts, job.pages)
+                except Exception:
+                    log(traceback.format_exc())
+                    warnings = []
+                text = document(job.path, body, job.pages, self._extra(info, warnings))
+                if self.opts.get("if_exists") == "overwrite":
+                    target = write_replace(job.path, text, job.folder)
+                else:
+                    target = write_new(job.path, text, job.folder)
+                try:
+                    self._registry_obj().record(
+                        info["doc_id"], job.path, info["content_hash"], info["source_size"], target,
+                        info["converter_version"], info["meta"], info["id_status"], info["id_candidates"],
+                    )
+                except Exception:
+                    log(traceback.format_exc())
                 with self._state_lock:
                     self.outputs.append(target)
+                    self.records.append({
+                        "source": str(job.path), "result": "converted", "output": str(target),
+                        "doc_id": info["doc_id"], "content_hash": info["content_hash"],
+                        "source_path": info["source_path"], "id_status": info["id_status"],
+                        "id_candidates": info["id_candidates"], "review": info["review"],
+                        "status": "warning" if warnings else "ok", "warnings": warnings,
+                        "meta": info["meta"],
+                    })
             except Exception as exc:
                 log(traceback.format_exc())
-                self._fail(job.path, exc)
+                self._fail(job.path, exc, {"doc_id": info.get("doc_id"), "content_hash": info.get("content_hash")})
 
     def run(self):
         idle_since = None
         try:
+            initial = self.opts.get("paths")
             while not self._cancel.is_set():
-                new = take_queue()
-                for path in self._expand(new):
+                if initial is not None:
+                    new, initial = list(initial), []  # 명령행: 대기열을 쓰지 않는다
+                elif "paths" in self.opts:
+                    new = []
+                else:
+                    new = take_queue()
+                for path, root in self._expand(new):
                     if self._cancel.is_set():
                         break
-                    self._add(path)
+                    self._add(path, root)
                 self._collect()
+                reg = self._registry
+                if reg is not None and reg._changes and time.time() - self._saved > 5:
+                    try:  # 도중에 꺼져도 기록이 남도록 가끔 저장한다
+                        reg.save()
+                    except Exception:
+                        log(traceback.format_exc())
+                    self._saved = time.time()
                 if self._jobs or new:
                     idle_since = None
                     time.sleep(0.1)
@@ -429,6 +623,11 @@ class Engine(threading.Thread):
         except Exception:
             log(traceback.format_exc())
         finally:
+            if self._registry is not None:
+                try:
+                    self._registry.save()
+                except Exception:
+                    log(traceback.format_exc())
             if self._pool is not None and not self._cancel.is_set():
                 self._pool.shutdown(wait=False)
             if self._local is not None and not self._cancel.is_set():

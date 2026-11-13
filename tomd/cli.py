@@ -1,8 +1,13 @@
 """파일을 마크다운으로 변환하는 실행 진입점.
 
-사용법:  tomd.exe 파일또는폴더 [파일또는폴더 ...]
+사용법:  tomd.exe 파일또는폴더 [파일또는폴더 ...]          (오른쪽 클릭 메뉴가 쓰는 방식)
 결과는 원본과 같은 폴더에 같은 이름의 .md 파일로 저장된다.
 환경 변수 TOMD_QUIET=1 이면 창을 띄우지 않는다 (자동 빌드 검사용).
+
+다른 프로그램에서 부를 때 (창 없이 실행, 끝나면 종료 코드: 0 성공 · 1 일부 실패 · 2 사용법 오류):
+  tomd.exe --input 경로 [--input 경로 ...] [--output 결과폴더]
+           [--meta 키=값 ...] [--if-exists new|skip|overwrite|always]
+           [--registry 기록.json | --registry none] [--report 결과.json]
 """
 import os
 import sys
@@ -98,11 +103,96 @@ def _run_once():
                 + "\n".join(lines),
                 error=True,
             )
+        elif snap["skipped"] and not snap["ok"]:
+            _message_box(f"같은 내용을 같은 버전으로 변환한 .md가 이미 있어 {len(snap['skipped'])}개 파일을 건너뛰었습니다.")
     return len(eng.snapshot()["failures"])
+
+
+def _parser():
+    import argparse
+
+    p = argparse.ArgumentParser(prog="tomd", add_help=True, exit_on_error=False)
+    p.add_argument("paths", nargs="*")
+    p.add_argument("--input", "-i", action="append", default=[])
+    p.add_argument("--output", "-o")
+    p.add_argument("--meta", "-m", action="append", default=[], help="키=값 (여러 번 쓸 수 있음)")
+    p.add_argument("--if-exists", default="new", choices=engine.IF_EXISTS)
+    p.add_argument("--registry")
+    p.add_argument("--report")
+    return p
+
+
+def _write_report(path, data):
+    import json
+
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def headless(args):
+    """명령행 실행: 대기열·창·확인 질문 없이 바로 변환하고 보고서를 남긴다."""
+    from . import catalog
+
+    report = None
+    for i, a in enumerate(args):  # 인수가 잘못되어도 보고서는 남길 수 있게 먼저 찾아 둔다
+        if a == "--report" and i + 1 < len(args):
+            report = args[i + 1]
+        elif a.startswith("--report="):
+            report = a.split("=", 1)[1]
+    try:
+        ns = _parser().parse_args(args)
+        report = ns.report
+        meta, errors = catalog.parse_cli_meta(ns.meta)
+        inputs = [os.path.abspath(p) for p in ns.input + ns.paths]
+        if not inputs:
+            errors.append("--input 으로 변환할 파일이나 폴더를 지정하세요.")
+        if errors:
+            raise ValueError(" / ".join(errors))
+    except (Exception, SystemExit) as exc:
+        message = str(exc) if not isinstance(exc, SystemExit) else "명령행 인수가 잘못되었습니다."
+        if report:
+            try:
+                _write_report(report, {"tool": "ToMD", "version": version_label(), "ok": False, "error": message, "files": []})
+            except Exception:
+                pass
+        if sys.stderr is not None:
+            print(message, file=sys.stderr)
+        return 2
+    registry = ns.registry
+    if registry and registry.lower() == "none":
+        registry = False
+    eng = engine.Engine({
+        "paths": inputs,
+        "output": os.path.abspath(ns.output) if ns.output else None,
+        "meta": meta,
+        "registry": os.path.abspath(registry) if registry else registry,
+        "if_exists": ns.if_exists,
+    })
+    started = time.time()
+    eng.start()
+    eng.join()
+    snap = eng.snapshot()
+    if report:
+        _write_report(report, {
+            "tool": "ToMD",
+            "version": version_label(),
+            "ok": not snap["failures"],
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started)),
+            "seconds": round(time.time() - started, 2),
+            "summary": {"converted": snap["ok"], "skipped": len(snap["skipped"]), "failed": len(snap["failures"])},
+            "files": eng.records,
+        })
+    return 1 if snap["failures"] else 0
 
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if any(a.startswith("-") and not os.path.exists(a) for a in args):
+        return headless(args)
     if not args:
         _message_box(
             "변환할 파일을 마우스 오른쪽 버튼으로 누른 뒤\n"

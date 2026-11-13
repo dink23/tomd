@@ -85,9 +85,15 @@ def run(engine):
                 errors.configure(state="disabled")
                 errors.pack(fill="x", pady=(8, 0), before=button)
                 show()
+            elif snap["skipped"] and not snap["ok"]:
+                # 아무것도 만들지 않았으면 이유를 보여 준다 (조용히 끝나면 고장으로 보인다)
+                title.configure(text="이미 변환한 파일입니다")
+                detail.configure(text=f"같은 내용을 같은 버전으로 변환한 .md가 있어 {len(snap['skipped'])}개를 건너뛰었습니다.")
+                show()
             elif state["shown"]:
                 title.configure(text="변환을 마쳤습니다")
-                detail.configure(text=f"{snap['ok']}개 파일을 변환했습니다.")
+                skipped = f" (이미 변환된 {len(snap['skipped'])}개는 건너뜀)" if snap["skipped"] else ""
+                detail.configure(text=f"{snap['ok']}개 파일을 변환했습니다.{skipped}")
                 root.after(CLOSE_AFTER, root.destroy)
             else:
                 root.destroy()

@@ -134,6 +134,35 @@ def write_new(source, text):
             n += 1
 
 
+def _chain(exc):
+    """예외와 그 원인들 (PdfminerException 안의 PDFPasswordIncorrect 같은 것까지)."""
+    seen = []
+    while exc is not None and exc not in seen and len(seen) < 10:
+        seen.append(exc)
+        inner = [a for a in getattr(exc, "args", ()) if isinstance(a, BaseException)]
+        exc = exc.__cause__ or (inner[0] if inner else None) or exc.__context__
+    return seen
+
+
+def reason(exc):
+    """실패 사유를 사용자가 알아볼 수 있는 말로 바꾼다."""
+    names = {type(e).__name__ for e in _chain(exc)}
+    text = " ".join(str(e) for e in _chain(exc))
+    if names & {"PDFPasswordIncorrect", "PDFEncryptionError", "PDFEncryptionWarning"}:
+        return "암호가 걸린 PDF입니다. 암호를 풀어 저장한 뒤 다시 변환하세요."
+    if "No /Root object" in text or names & {"PDFSyntaxError", "PSEOF", "PDFNoValidXRef"}:
+        return "PDF 파일이 손상되었거나 PDF 형식이 아닙니다."
+    if names & {"BadZipFile", "PackageNotFoundError", "InvalidFileException"}:
+        return "파일이 손상되었거나 확장자와 실제 형식이 다릅니다. 원래 프로그램에서 열어 다시 저장해 보세요."
+    if "PermissionError" in names:
+        return "파일을 읽거나 결과를 저장할 권한이 없습니다. 다른 프로그램에서 열려 있거나 쓰기가 막힌 폴더일 수 있습니다."
+    if "MemoryError" in names:
+        return "파일이 너무 커서 메모리가 부족합니다."
+    if "BrokenProcessPool" in names:
+        return "변환 작업이 비정상적으로 끝났습니다. 파일을 하나씩 다시 변환해 보세요."
+    return str(exc) or exc.__class__.__name__
+
+
 class _Job:
     def __init__(self, path):
         self.path = path
@@ -191,8 +220,8 @@ class Engine(threading.Thread):
     # -- 내부
     def _fail(self, path, exc):
         with self._state_lock:
-            self.failures.append((Path(path).name, str(exc) or exc.__class__.__name__))
-        log(f"{path}: {exc}")
+            self.failures.append((Path(path).name, reason(exc)))
+        log(f"{path}: {exc!r}")
 
     def _expand(self, paths):
         for raw in paths:
@@ -222,6 +251,13 @@ class Engine(threading.Thread):
             return
         if not path.is_file():
             self._fail(path, FileNotFoundError("파일을 찾을 수 없습니다."))
+            return
+        try:
+            empty = path.stat().st_size == 0
+        except OSError:
+            empty = False
+        if empty:
+            self._fail(path, ValueError("빈 파일(0바이트)입니다."))
             return
         if self._pool is None:
             self._pool = ProcessPoolExecutor(max_workers=self.workers)

@@ -293,6 +293,37 @@ def _text_frame_md(shape):
     return "\n".join(lines).rstrip()
 
 
+def _guess_title(slide, slide_height):
+    """제목 개체 틀 없이 글상자로만 만든 슬라이드에서 제목으로 쓸 글상자를 고른다.
+
+    슬라이드 위쪽에 있는 짧은 글상자 가운데 글자가 가장 큰 것(같으면 더 위의 것)을 고른다.
+    """
+    found = []
+
+    def walk(shapes):
+        for shape in shapes:
+            try:
+                if shape.shape_type == 6:
+                    walk(shape.shapes)
+                    continue
+                if not shape.has_text_frame or _ph_type(shape):
+                    continue
+                paras = [p for p in shape.text_frame.paragraphs if _para_text(p)]
+                text = " ".join(_para_text(p) for p in paras)
+                if not paras or len(paras) > 2 or len(text) > 60 or _BULLET.match(text):
+                    continue
+                top = shape.top
+                if top is None or not slide_height or top > 0.3 * slide_height:
+                    continue
+                sizes = [r.font.size.pt for p in paras for r in p.runs if r.font.size]
+                found.append((-(max(sizes) if sizes else 0), top, len(found), shape))
+            except Exception:
+                continue
+
+    walk(slide.shapes)
+    return min(found)[3] if found else None
+
+
 def convert_pptx(path):
     from pptx import Presentation
 
@@ -305,6 +336,8 @@ def convert_pptx(path):
                 if shape.text_frame.text.strip():
                     title_shape = shape
                     break
+        if title_shape is None:
+            title_shape = _guess_title(slide, prs.slide_height)
         title = " ".join(title_shape.text_frame.text.split()) if title_shape is not None else ""
         hidden = slide._element.get("show") in ("0", "false")
         heading = f"## 슬라이드 {n}" + (" (숨김)" if hidden else "") + (f": {title}" if title else "")
@@ -313,7 +346,8 @@ def convert_pptx(path):
 
         def walk(shapes):
             for shape in shapes:
-                if title_shape is not None and shape.shape_id == title_shape.shape_id:
+                # 도형 번호(id)는 복사·붙여넣기한 파일에서 겹칠 수 있으므로 문서 속 요소 자체로 비교한다
+                if title_shape is not None and shape._element is title_shape._element:
                     continue
                 kind = _ph_type(shape)
                 if kind in ("SLIDE_NUMBER", "DATE"):

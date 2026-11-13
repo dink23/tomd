@@ -241,7 +241,7 @@ def convert_hwp(path):
             head = f.read(4)
         if head[:2] == b"PK":
             return convert_hwpx(path)
-        raise ConvertError("지원하지 않는 한글 문서 형식입니다. (한글 97 이전 형식일 수 있습니다)")
+        raise ConvertError("한글 문서가 아니거나 손상된 파일입니다. (한글 97 이전 형식이면 한글에서 열어 새 형식으로 저장하세요)")
     ole = olefile.OleFileIO(path)
     try:
         if not ole.exists("FileHeader"):

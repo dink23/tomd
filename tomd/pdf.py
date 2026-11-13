@@ -171,27 +171,133 @@ _LETTER = re.compile(r"[가-힣A-Za-z]")
 
 
 def _vertical_runs(chars):
-    """한 글자씩 세로로 쌓아 쓴 글(책등, 세로 제목)을 찾아 (첫 글자 위치, 글, 글자들)로 돌려준다."""
+    """한 글자씩 세로로 쌓아 쓴 글(책등, 세로 제목)을 찾아 글자 목록들로 돌려준다.
+
+    낱말 사이의 빈칸 글자도 함께 담아 띄어쓰기를 살린다.
+    """
     runs, current = [], []
 
     def close():
-        letters = sum(1 for c in current if _LETTER.match(c["text"]))
-        if len(current) >= 5 and letters >= 0.8 * len(current):
+        solid = [c for c in current if not c["text"].isspace()]
+        letters = sum(1 for c in solid if _LETTER.match(c["text"]))
+        if len(solid) >= 5 and letters >= 0.8 * len(solid):
+            while current and current[-1]["text"].isspace():
+                current.pop()
             runs.append(list(current))
         current.clear()
 
+    def same_column(a, b):
+        return abs((b["x0"] + b["x1"]) / 2 - (a["x0"] + a["x1"]) / 2) < 0.3 * max(a["width"], 1)
+
     for ch in chars:
+        solid = [c for c in current if not c["text"].isspace()]
+        prev = solid[-1] if solid else None
         if ch["text"].isspace():
+            if prev is not None and same_column(prev, ch) and 0 <= ch["top"] - prev["top"] <= 2.5 * prev["height"]:
+                current.append(ch)
             continue
-        if current:
-            prev = current[-1]
+        if prev is not None:
             step = ch["top"] - prev["top"]
-            same_column = abs((ch["x0"] + ch["x1"]) / 2 - (prev["x0"] + prev["x1"]) / 2) < 0.3 * max(prev["width"], 1)
-            if not (same_column and 0.7 * prev["height"] <= step <= 2.2 * prev["height"]):
+            spaced = current[-1]["text"].isspace()
+            limit = (3.5 if spaced else 2.2) * prev["height"]
+            if not (same_column(prev, ch) and 0.7 * prev["height"] <= step <= limit):
                 close()
         current.append(ch)
     close()
     return runs
+
+
+def _oblique(ch):
+    """글자가 비스듬히 놓였는가 (원을 따라 휘어 쓴 글). 90도 단위로 돌린 글자는 아니다."""
+    m = ch.get("matrix")
+    if not m:
+        return False
+    a, b = abs(m[0]), abs(m[1])
+    return min(a, b) > 0.08 * (a + b)
+
+
+def _curved_runs(chars):
+    """곡선을 따라 쓴 글자들을 글자 흐름 순서대로 묶는다.
+
+    이런 글자는 높이가 제각각이라 가로 줄로 묶으면 한두 글자씩 흩어진다.
+    """
+    runs, run, bridge = [], [], []
+
+    def close():
+        if sum(1 for c in run if not c["text"].isspace()) >= 4:
+            runs.append(list(run))
+        run.clear()
+        bridge.clear()
+
+    for ch in chars:
+        near = True
+        if run:
+            last = run[-1]
+            size = max(last["height"], last["width"], ch["height"], 1)
+            near = (abs(ch["x0"] - last["x0"]) < 2.5 * size and abs(ch["top"] - last["top"]) < 2.5 * size)
+        if _oblique(ch):
+            if not near:
+                close()
+            run.extend(bridge)
+            bridge.clear()
+            run.append(ch)
+        elif run and near and len(bridge) < 3:
+            bridge.append(ch)  # 곡선 꼭대기의 거의 바로 선 글자·빈칸은 이어 준다
+        else:
+            close()
+    close()
+    return runs
+
+
+def _side_by_side(lines, tol, ytol, page_chars=()):
+    """선 없이 좌우로 나란히 놓인 글 묶음(왼쪽 이름표 + 오른쪽 항목들)을 칸으로 가른다.
+
+    모든 줄에 걸쳐 글자가 하나도 없는 세로 틈이 있으면 그 틈을 기준으로 나눈다.
+    나눌 수 없으면 None, 나눴으면 칸별 글 목록을 돌려준다.
+    """
+    from pdfplumber.utils import extract_text
+
+    every = [c for ln in lines for c in ln.get("chars", [])]
+    chars = [c for c in every if not c["text"].isspace()]
+    if chars and page_chars:
+        # 줄에 딸린 글자 목록에는 빈칸 글자가 빠져 있으므로, 같은 영역의 빈칸 글자를 쪽에서 가져온다
+        x0, x1 = min(c["x0"] for c in chars), max(c["x1"] for c in chars)
+        top, bottom = min(c["top"] for c in chars), max(c["bottom"] for c in chars)
+        every = every + [
+            c for c in page_chars
+            if c["text"].isspace() and x0 <= (c["x0"] + c["x1"]) / 2 <= x1
+            and top <= (c["top"] + c["bottom"]) / 2 <= bottom
+        ]
+    if len(chars) < 8:
+        return None
+    size = sorted(c["bottom"] - c["top"] for c in chars)[len(chars) // 2]
+    gap_min = max(15, 1.5 * size)
+    spans = sorted((c["x0"], c["x1"]) for c in chars)
+    cuts, reach = [], spans[0][1]
+    for x0, x1 in spans[1:]:
+        if x0 - reach >= gap_min:
+            cuts.append((reach + x0) / 2)
+        reach = max(reach, x1)
+    if not cuts or len(cuts) > 3:
+        return None
+    columns = [[] for _ in range(len(cuts) + 1)]
+    for c in every:  # 빈칸 글자도 함께 넣어야 낱말 사이 띄어쓰기가 살아난다
+        columns[sum(1 for cut in cuts if (c["x0"] + c["x1"]) / 2 > cut)].append(c)
+    texts = []
+    for col in columns:
+        text = extract_text(col, x_tolerance=tol, y_tolerance=ytol).strip()
+        rows = [t.strip() for t in text.split("\n") if t.strip()]
+        letters = len(re.sub(r"\s", "", text))
+        # 번호·글머리표만 있는 칸(1. 2. / 가. 나.)은 목록의 내어쓰기이지 칸이 아니다
+        if not rows or letters < 6 or letters / len(rows) < 3:
+            return None
+        # 오른쪽 끝에 따로 붙인 "(단위: 천원)" 같은 주석은 칸이 아니다
+        if len(rows) == 1 and re.match(r"^[(\[〔<].*[)\]〕>]$", rows[0]):
+            return None
+        texts.append(rows)
+    if sum(len(rows) for rows in texts) < 3:
+        return None
+    return texts
 
 
 def _clean_page(page):
@@ -367,6 +473,154 @@ def _snap(values, tolerance):
         mapping[v] = index
         last = v
     return mapping
+
+
+def _open_side_borders(page):
+    """좌우 테두리 없이 가로선과 안쪽 세로선만 그은 표에 양옆 세로선을 보태 준다.
+
+    이런 표는 칸의 네 귀퉁이가 닫히지 않아 선만으로는 표로 잡히지 않는다.
+    """
+    rows = {}
+    for e in page.edges:
+        if e.get("orientation") == "h" and e["x1"] - e["x0"] > 5:
+            rows.setdefault(round(e["top"]), []).append((e["x0"], e["x1"]))
+    spans = []  # (x0, x1, y) : 같은 높이에서 이어진 조각을 합친 가로선
+    for y, parts in rows.items():
+        parts.sort()
+        a, b = parts[0]
+        for x0, x1 in parts[1:]:
+            if x0 <= b + 2:
+                b = max(b, x1)
+            else:
+                spans.append((a, b, y))
+                a, b = x0, x1
+        spans.append((a, b, y))
+    groups = []
+    for a, b, y in sorted(spans):
+        if b - a < 100:
+            continue
+        for g in groups:
+            if abs(g[0] - a) <= 2 and abs(g[1] - b) <= 2:
+                g[2].append(y)
+                break
+        else:
+            groups.append([a, b, [y]])
+    verticals = [e for e in page.edges if e.get("orientation") == "v" and e["bottom"] - e["top"] > 5]
+    added = []
+    for a, b, ys in groups:
+        if len(ys) < 3:
+            continue
+        ys = sorted(set(ys))
+
+        def spanned(x_ok, y1, y2):
+            return sum(
+                min(v["bottom"], y2) - max(v["top"], y1)
+                for v in verticals if x_ok(v["x0"]) and v["bottom"] > y1 and v["top"] < y2
+            ) >= 0.5 * (y2 - y1)
+
+        for x in (a, b):
+            run = []  # 테두리를 보탤 연속 구간
+            for y1, y2 in list(zip(ys, ys[1:])) + [(None, None)]:
+                # 칸을 나누는 안쪽 세로선이 지나가는 줄 사이에만 보탠다 (표와 표 사이는 잇지 않는다)
+                need = (
+                    y1 is not None
+                    and spanned(lambda vx: a + 5 < vx < b - 5, y1, y2)
+                    and not spanned(lambda vx: abs(vx - x) <= 3, y1, y2)
+                )
+                if need:
+                    run.append((y1, y2))
+                    continue
+                if len(run) >= 2:
+                    top, bottom = run[0][0], run[-1][1]
+                    added.append({
+                        "object_type": "line", "x0": x, "x1": x, "top": top, "bottom": bottom,
+                        "width": 0, "height": bottom - top, "orientation": "v",
+                    })
+                run = []
+    return added
+
+
+def _is_white(color):
+    if color is None:
+        return True
+    if isinstance(color, (int, float)):
+        color = (color,)
+    try:
+        values = [float(v) for v in color]
+    except (TypeError, ValueError):
+        return True
+    if len(values) == 4:
+        return sum(values) < 0.05
+    return all(v > 0.97 for v in values)
+
+
+def _fills(page):
+    """칸을 색으로 칠한 사각형들 [(x0, top, x1, bottom, 색)] — 그린 순서대로."""
+    out = []
+    for r in page.rects:
+        if not r.get("fill") or _is_white(r.get("non_stroking_color")):
+            continue
+        if r["x1"] - r["x0"] < 3 or r["bottom"] - r["top"] < 3:
+            continue
+        color = r.get("non_stroking_color")
+        if isinstance(color, (int, float)):
+            color = (color,)
+        out.append((r["x0"], r["top"], r["x1"], r["bottom"], tuple(round(float(v), 2) for v in color)))
+    return out
+
+
+def _mark_shaded(raw, fills, spans):
+    """일정표처럼 빈칸을 색으로 칠해 뜻을 나타낸 표에서, 칠해진 빈칸에 ■를 넣는다.
+
+    글이 든 칸에도 쓰인 색(머리글 바탕, 줄무늬)은 꾸밈이므로 표시하지 않는다.
+    같은 행과 같은 열에 글이 있는 칸(행 이름·열 이름이 있는 자리)만 표시한다.
+    spans는 칸마다의 (첫 행, 끝 행, 첫 열, 끝 열).
+    """
+    def color_at(b):
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        found = None
+        for x0, top, x1, bottom, color in fills:
+            if x0 - 1 <= cx <= x1 + 1 and top - 1 <= cy <= bottom + 1:
+                found = color
+        return found
+
+    if not raw or not spans:
+        return raw
+    colors = [color_at(b) for b, _ in raw]
+    first_row = min(sp[0] for sp in spans)
+    rows, cols = set(), set()        # 한 줄·한 칸짜리 글 칸이 있는 행과 열 (행 이름·열 이름)
+    row_colors, col_colors = {}, {}  # 글이 든 칸의 바탕색: 줄무늬·강조 열은 꾸밈으로 본다
+    for (_, text), color, (r0, r1, c0, c1) in zip(raw, colors, spans):
+        if not text.strip():
+            continue
+        if r1 - r0 == 1:
+            rows.add(r0)
+        if c1 - c0 == 1:
+            cols.add(c0)
+        if color:
+            for r in range(r0, r1):
+                row_colors.setdefault(r, set()).add(color)
+            if r0 > first_row:  # 머리글 줄의 바탕색은 일정 막대와 같은 색일 수 있다
+                for c in range(c0, c1):
+                    col_colors.setdefault(c, set()).add(color)
+    empty = [i for i, (_, text) in enumerate(raw) if not text.strip()]
+    marks = []
+    for i in empty:
+        r0, r1, c0, c1 = spans[i]
+        color = colors[i]
+        if not color or r0 == first_row:
+            continue
+        if not rows.intersection(range(r0, r1)) or not cols.intersection(range(c0, c1)):
+            continue
+        if any(color in row_colors.get(r, ()) for r in range(r0, r1)):
+            continue
+        if any(color in col_colors.get(c, ()) for c in range(c0, c1)):
+            continue
+        marks.append(i)
+    if len(marks) >= 3 and len(marks) < len(empty):
+        for i in marks:
+            raw[i] = (raw[i][0], "■")
+    return raw
 
 
 def _cell_texts(tbl, chars, tol, ytol=3):
@@ -548,7 +802,7 @@ class _Broken(Exception):
     """선으로 찾은 칸에 들어가지 않는 글자가 많아 표 구조를 믿을 수 없다."""
 
 
-def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None):
+def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None, fills=None):
     raw = []
     if chars is not None:
         texts, orphans, total, sprawling, taken = _cell_texts(tbl, chars, tol, ytol)
@@ -576,6 +830,13 @@ def _table_cells(tbl, tol=3, lost=None, chars=None, ytol=3, claimed=None):
         return []
     xmap = _snap([b[0] for b, _ in raw] + [b[2] for b, _ in raw], SNAP_X)
     ymap = _snap([b[1] for b, _ in raw] + [b[3] for b, _ in raw], SNAP_Y)
+    if fills:
+        # 열·행 경계를 맞춘 뒤에도 남는 칸만 대상으로 한다 (칸 안쪽 여백 조각 제외)
+        real = [i for i, (b, _) in enumerate(raw) if xmap[b[2]] > xmap[b[0]] and ymap[b[3]] > ymap[b[1]]]
+        spans = [(ymap[raw[i][0][1]], ymap[raw[i][0][3]], xmap[raw[i][0][0]], xmap[raw[i][0][2]]) for i in real]
+        marked = _mark_shaded([raw[i] for i in real], fills, spans)
+        for i, item in zip(real, marked):
+            raw[i] = item
     cells = []
     for (x0, top, x1, bottom), text in raw:
         c0, c1, r0, r1 = xmap[x0], xmap[x1], ymap[top], ymap[bottom]
@@ -642,43 +903,94 @@ def _drop_nested(tables):
 
 def _page_blocks(page, shifts=None):
     page = _clean_page(page)
+    original = page
     # 세로로 쌓아 쓴 글은 가로 글과 섞이면 한 글자씩 흩어지므로 따로 떼어 한 줄로 만든다
     vertical = []
     try:
         runs = _vertical_runs(page.chars)
     except Exception:
         runs = []
+    try:
+        curved = _curved_runs(page.chars)
+    except Exception:
+        curved = []
+    if curved:
+        used = {id(c) for run in runs for c in run}
+        curved = [run for run in curved if not any(id(c) in used for c in run)]
+        for run in curved:
+            text = re.sub(r"\s+", " ", "".join(c["text"] for c in run)).strip()
+            vertical.append((min(c["top"] for c in run), text))
+        gone = {id(c) for run in curved for c in run}
+        page = page.filter(lambda o: id(o) not in gone)
     if runs:
         taken = {id(c) for run in runs for c in run}
         for run in runs:
             text, last = "", None
             for c in run:
-                if last is not None and c["top"] - last["bottom"] > 0.5 * last["height"]:
+                if c["text"].isspace():
+                    if text and not text.endswith(" "):
+                        text += " "
+                    last = None
+                    continue
+                if last is not None and c["top"] - last["bottom"] > 0.5 * last["height"] and not text.endswith(" "):
                     text += " "
                 text += c["text"]
                 last = c
-            vertical.append((run[0]["top"], text))
+            vertical.append((run[0]["top"], text.strip()))
         page = page.filter(lambda o: id(o) not in taken)
     page, rotated, extra = _upright_page(page)
     if rotated:
+        # 돌려 놓은 쪽에서는 떼어 낸 글의 자리를 맞출 수 없다. 버리면 글이 빠지므로
+        # 떼어 내기 전의 쪽으로 되돌려 모든 글자를 본문 흐름에 남긴다.
         vertical = []
+        if page is not original and (runs or curved):
+            page, rotated, extra = _upright_page(original)
     tol = 1.5 if rotated else 3
     lost = [0]
     heights = sorted(c["bottom"] - c["top"] for c in page.chars) or [10]
     # 글자가 아주 작은 쪽은 줄 간격도 좁으므로 줄을 가르는 허용치를 글자 크기에 맞춘다
     ytol = min(3, max(0.8, heights[len(heights) // 2] * 0.4))
     page, restored = _restore_glyphs(page, tol, shifts if shifts is not None else {}, ytol)
+    settings = {"text_x_tolerance": tol}
     try:
-        tables = _drop_nested(page.find_tables({"text_x_tolerance": tol}))
+        tables = _drop_nested(page.find_tables(settings))
     except Exception:
         tables = []
+    fills = []
+    if not rotated:
+        # 양옆 테두리가 없어 표로 잡히지 않은 구간에만 세로선을 보태 다시 찾는다.
+        # 이미 표로 잡힌 구간은 건드리지 않는다 (잘 되던 표의 칸 구조가 바뀌지 않도록).
+        try:
+            def found(line):
+                got = sum(
+                    max(0, min(t.bbox[3], line["bottom"]) - max(t.bbox[1], line["top"]))
+                    for t in tables if t.bbox[0] - 5 <= line["x0"] <= t.bbox[2] + 5
+                )
+                return got >= 0.6 * (line["bottom"] - line["top"])
+
+            borders = [ln for ln in _open_side_borders(page) if not found(ln)]
+            if borders:
+                again = _drop_nested(page.find_tables(dict(settings, explicit_vertical_lines=borders)))
+                # 보탠 선으로 새로 생긴 표가 온전할 때만 받아들인다 (장식 선이 많은 디자인 문서 보호)
+                before = {tuple(round(v) for v in t.bbox) for t in tables}
+                fresh = [t for t in again if tuple(round(v) for v in t.bbox) not in before]
+                for t in fresh:
+                    _table_cells(t, tol, [0], page.chars, ytol, set())
+                if fresh:
+                    tables = again
+        except Exception:
+            pass
+        try:
+            fills = _fills(page)
+        except Exception:
+            fills = []
     chars = page.chars if tables else None
     prepared = []  # (영역, 변환된 글)
     claimed = set()  # 표 밖에 있지만 표의 칸으로 가져간 글자
     for t in tables:
         bbox = t.bbox
         try:
-            rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol, claimed))
+            rendered = table.render_flat(_table_cells(t, tol, lost, chars, ytol, claimed, fills))
         except _Broken as broken:
             # 표 영역이 실제보다 좁게 잡히는 일이 많아 같은 높이의 쪽 전체 너비를 본다
             bbox = (page.bbox[0], t.bbox[1], page.bbox[2], t.bbox[3])
@@ -709,11 +1021,27 @@ def _page_blocks(page, shifts=None):
     items.sort(key=lambda x: x[0])
 
     blocks, para, last_bottom = [], [], None
+    columns_at = {}  # blocks 안의 자리 -> 좌우로 나란한 묶음의 칸별 글
+
+    def flush():
+        if not para:
+            return
+        split = None
+        if len(para) >= 2 and not rotated:
+            try:
+                split = _side_by_side([ln for _, ln in para], tol, ytol, text_page.chars)
+            except Exception:
+                split = None
+        if split:
+            columns_at[len(blocks)] = split
+            blocks.append("")
+        else:
+            blocks.append("\n".join(t for t, _ in para))
+        para.clear()
+
     for _, kind, obj in items:
         if kind == "table":
-            if para:
-                blocks.append("\n".join(para))
-                para = []
+            flush()
             if obj:
                 blocks.append(obj)
             last_bottom = None
@@ -725,12 +1053,41 @@ def _page_blocks(page, shifts=None):
             continue
         height = max(obj["bottom"] - obj["top"], 1)
         if para and last_bottom is not None and obj["top"] - last_bottom > height * 0.8:
-            blocks.append("\n".join(para))
-            para = []
-        para.append(text)
+            flush()
+        para.append((text, obj))
         last_bottom = obj["bottom"]
-    if para:
-        blocks.append("\n".join(para))
+    flush()
+    # 잇달아 나온 나란한 묶음은 한 표의 행들로 모은다
+    def width_of(block):
+        rows = block.split("\n")
+        if len(rows) >= 2 and rows[0].startswith("| ") and re.fullmatch(r"\|( --- \|)+", rows[1]):
+            return rows[1].count("---")
+        return 0
+
+    merged, i, grown = [], 0, False  # grown: 바로 앞 블록이 나란한 묶음으로 만든(이어 붙인) 표인가
+    while i < len(blocks):
+        if i not in columns_at:
+            block = blocks[i]
+            if grown and width_of(block) and width_of(block) == width_of(merged[-1]):
+                rows = block.split("\n")  # 같은 표가 선 있는 부분과 없는 부분으로 갈린 것이다
+                merged[-1] += "\n" + "\n".join(rows[:1] + rows[2:])
+            else:
+                merged.append(block)
+                grown = False
+            i += 1
+            continue
+        rows, width = [], len(columns_at[i])
+        while i in columns_at and len(columns_at[i]) == width:
+            rows.append(["\n".join(_CID.sub("", c) for c in col) for col in columns_at[i]])
+            i += 1
+        rendered = table.render_flat(table.from_grid(rows))
+        if merged and width_of(merged[-1]) == width:
+            body = rendered.split("\n")
+            merged[-1] += "\n" + "\n".join(body[:1] + body[2:])
+        else:
+            merged.append(rendered)
+        grown = True
+    blocks = merged
     if extra:
         blocks.append("\n".join(_CID.sub("", line) for line in extra))
     if lost[0]:

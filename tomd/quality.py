@@ -38,11 +38,6 @@ def _xlsx(path):
     try:
         with zipfile.ZipFile(path) as z:
             names = z.namelist()
-            book = next((n for n in names if n.lower() == "xl/workbook.xml"), None)
-            if book:
-                hidden = len(re.findall(rb'<sheet\b[^>]*\bstate="(?:hidden|veryHidden)"', z.read(book)))
-                if hidden:
-                    warnings.append(f"숨긴 시트 {hidden}개는 변환하지 않았습니다.")
             uncached = 0
             for name in names:
                 if re.match(r"xl/worksheets/sheet\d+\.xml$", name):
@@ -72,6 +67,11 @@ def check(path, kind, body, parts=None, total=None):
                 only_pictures += 1
         if only_pictures:
             warnings.append(f"그림만 있는 슬라이드 {only_pictures}장은 글로 옮길 내용이 없습니다.")
+    sheets = re.search(r"^> 숨긴 시트 (\d+)개", body, flags=re.M)
+    if sheets:
+        warnings.append(f"숨긴 시트 {sheets.group(1)}개는 변환하지 않았습니다.")
+    if re.search(r"^> 숨긴 (?:행|열) \d+개", body, flags=re.M):
+        warnings.append("숨긴 행·열은 변환하지 않았습니다 (시트 아래 안내 참고).")
     masked = re.search(r"등으로 보이는 (\d+)곳은 `\*\*\*\*`로 가렸습니다", body)
     if masked:
         warnings.append(f"매크로 코드에서 비밀번호·개인 정보로 보이는 {masked.group(1)}곳을 가렸습니다.")

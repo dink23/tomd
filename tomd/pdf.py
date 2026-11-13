@@ -325,6 +325,21 @@ def _keep_stream_order(chars):
     return out
 
 
+# Symbol·Wingdings 계열 글꼴의 글머리 기호는 사용자 영역 문자(U+F0xx)로 나온다
+_SYMBOL_GLYPHS = {0xF0B7: "•", 0xF0A7: "▪", 0xF06C: "●", 0xF06E: "■", 0xF071: "□", 0xF0A8: "◦",
+                  0xF0D8: "➢", 0xF0FC: "✓", 0xF076: "❖", 0xF0E0: "→", 0xF0E8: "➔", 0xF0A1: "○"}
+_MARGIN = "\x02"  # 쪽 가장자리 줄 표시 (assemble 에서 머리말·꼬리말인지 가린다)
+_BULLET_LINE = re.compile(r"^(•)\s*(.*)$")  # □ ○ ◦ - 같은 한국 문서의 단계 기호는 그대로 둔다
+
+
+def _symbol_glyph(ch):
+    text = ch.get("text") or ""
+    if len(text) == 1 and 0xF000 <= ord(text) <= 0xF0FF and re.search(r"symbol|wingding|dingbat", ch.get("fontname", ""), re.I):
+        ch = dict(ch)
+        ch["text"] = _SYMBOL_GLYPHS.get(ord(text), "•")
+    return ch
+
+
 def _clean_page(page):
     """쪽 밖에 놓인 도형과 글을 버리고, 겹쳐 찍힌 글자와 줄에서 떨어진 작은 글자를 정리한다."""
     x0, top, x1, bottom = page.bbox
@@ -335,6 +350,7 @@ def _clean_page(page):
             if not ("x0" in o and (o["x1"] < x0 or o["x0"] > x1 or o["bottom"] < top or o["top"] > bottom))
         ]
         if kind == "char":
+            kept = [_symbol_glyph(o) for o in kept]
             cleaned = _dedupe_chars(_align_small_glyphs(_keep_stream_order(kept)))
             changed = changed or len(cleaned) != len(kept) or any(a is not b for a, b in zip(cleaned, kept))
             kept = cleaned
@@ -971,6 +987,182 @@ def _text_columns(tbl, chars, tol, ytol):
     return table.from_grid(rows)
 
 
+def _column_layout(page, tol, ytol):
+    """두 단 편집 쪽을 찾는다. [(위, 아래, 가르는 x 또는 None)] 차례대로, 두 단이 없으면 None.
+
+    단 사이 세로 틈(글자가 걸치지 않는 x)을 찾고, 그 틈에 걸치는 줄(제목·한 단 문단)이 나오는 곳에서
+    구역을 나눈다. 두 단 구역은 왼쪽 단 전체 → 오른쪽 단 전체 순서로 읽는다.
+    """
+    try:
+        words = page.extract_words(x_tolerance=tol, y_tolerance=ytol)
+    except Exception:
+        return None
+    words = [w for w in words if w["text"].strip()]
+    if len(words) < 40:
+        return None
+    width = page.bbox[2] - page.bbox[0]
+    left_edge = page.bbox[0]
+    # 같은 높이의 낱말들을 줄로 묶는다 (두 단의 줄 높이가 서로 달라도 따로 묶인다)
+    words.sort(key=lambda w: (round(w["top"]), w["x0"]))
+    rows = []
+    for w in words:
+        if rows and abs(w["top"] - rows[-1]["top"]) <= 2 and abs(w["bottom"] - rows[-1]["bottom"]) <= 3:
+            rows[-1]["words"].append(w)
+            rows[-1]["bottom"] = max(rows[-1]["bottom"], w["bottom"])
+        else:
+            rows.append({"top": w["top"], "bottom": w["bottom"], "words": [w]})
+    # 단 사이 틈: 거의 모든 줄에서 글자가 덮지 않는 세로 띠. 칸 안 낱말 사이 틈은 줄마다 자리가 달라
+    # 다른 줄의 글자가 덮으므로, 여러 줄에 걸쳐 비어 있는 곳만 남는다.
+    lo_x, hi_x = int(left_edge + width * 0.25), int(left_edge + width * 0.75)
+    cover = []
+    for x in range(lo_x, hi_x + 1):
+        cover.append(sum(1 for row in rows if any(w["x0"] <= x <= w["x1"] for w in row["words"])))
+    least = min(cover)
+    if least > 0.35 * len(rows):
+        return None
+    limit = least + max(2, int(0.06 * len(rows)))
+    runs, start = [], None
+    for i, c in enumerate(cover + [limit + 1]):
+        if c <= limit and start is None:
+            start = i
+        elif c > limit and start is not None:
+            runs.append((i - start, start, i - 1))
+            start = None
+    run_width, a_i, b_i = max(runs)
+    if run_width < 8:
+        return None
+    split = lo_x + (a_i + b_i) / 2
+    # 틈의 실제 가장자리: 왼쪽 단 줄(왼쪽 여백에서 시작)의 끝과 오른쪽 단 줄(오른쪽 여백까지 가는)의 시작
+    reach = 0.25 * width
+    left_max = max(
+        (w["x1"] for row in rows if min(v["x0"] for v in row["words"]) < split - reach
+         for w in row["words"] if w["x1"] <= split),
+        default=lo_x + a_i,
+    )
+    right_min = min(
+        (w["x0"] for row in rows if max(v["x1"] for v in row["words"]) > split + reach
+         for w in row["words"] if w["x0"] >= split),
+        default=lo_x + b_i,
+    )
+    if right_min - left_max < 6:
+        return None
+    split = (left_max + right_min) / 2
+    lefts = sum(1 for row in rows if any(split - 80 <= w["x1"] <= split for w in row["words"]))
+    rights = sum(1 for row in rows if any(split <= w["x0"] <= split + 80 for w in row["words"]))
+    if min(lefts, rights) < 5:
+        return None
+
+    def side(row):
+        # 틈 안으로 들어온 낱말이 있으면 단을 가로지르는 줄이다 (가운데 정렬한 꼬리말 등)
+        if any(w["x1"] > left_max + 1 and w["x0"] < right_min - 1 for w in row["words"]):
+            return "X"
+        has_l = any(w["x1"] <= split for w in row["words"])
+        has_r = any(w["x0"] >= split for w in row["words"])
+        return "B" if has_l and has_r else ("L" if has_l else "R")
+
+    kinds = [side(r) for r in rows]
+    # 보통 줄 간격 (두 단의 줄이 엇갈려 섞이므로 줄 높이로 어림한다)
+    heights = sorted(r["bottom"] - r["top"] for r in rows)
+    pitch = 2 * heights[len(heights) // 2] if heights else 15
+    # 두 단 구역: 걸치는 줄(X) 없이 이어진 줄들 가운데 양쪽에 글이 있는 구역
+    segments, cur = [], []
+    for row, kind in zip(rows, kinds):
+        if kind == "X":
+            if cur:
+                segments.append(("run", cur))
+                cur = []
+            segments.append(("cross", [(row, kind)]))
+        else:
+            cur.append((row, kind))
+    if cur:
+        segments.append(("run", cur))
+    out = []  # (줄 목록, 두 단인가)
+    for tag, items in segments:
+        if tag == "cross":
+            out.append((items, False))
+            continue
+        sides = {k for _, k in items}
+        lefts = [r for r, k in items if k in ("L", "B")]
+        rights = [r for r, k in items if k in ("R", "B")]
+        if not (len(lefts) >= 3 and len(rights) >= 3):
+            out.append((items, False))
+            continue
+        # 앞뒤에 한쪽에만 있고 같은 쪽 다음 줄과 멀리 떨어진 줄은 한 단 글(구역 사이 제목 등)이다
+        head, tail = [], []
+        while items:
+            row, kind = items[-1]
+            if kind == "B" or len(items) < 2:
+                break
+            prev_same = [r for r, k in items[:-1] if k in (kind, "B")]
+            if prev_same and row["top"] - prev_same[-1]["top"] > 3 * pitch:
+                tail.insert(0, items.pop())
+            else:
+                break
+        while items:
+            row, kind = items[0]
+            if kind == "B" or len(items) < 2:
+                break
+            next_same = [r for r, k in items[1:] if k in (kind, "B")]
+            if next_same and next_same[0]["top"] - row["top"] > 3 * pitch:
+                head.append(items.pop(0))
+            else:
+                break
+        if head:
+            out.append((head, False))
+        # 진짜 두 단 본문이면 양쪽 줄 대부분이 단 너비를 채운다 (짧은 이름표 + 설명 같은 표 모양은 아님)
+        lrows = [r for r, k in items if k in ("L", "B")]
+        rrows = [r for r, k in items if k in ("R", "B")]
+        lstart = min(w["x0"] for r in lrows for w in r["words"] if w["x1"] <= split)
+        rend = max(w["x1"] for r in rrows for w in r["words"] if w["x0"] >= split)
+        lwidth, rwidth = max(left_max - lstart, 1), max(rend - right_min, 1)
+        lwords = [[w for w in r["words"] if w["x1"] <= split] for r in lrows]
+        rwords = [[w for w in r["words"] if w["x0"] >= split] for r in rrows]
+        lfull = [ws for ws in lwords if max(w["x1"] for w in ws) >= left_max - 0.1 * lwidth]
+        rfull = [ws for ws in rwords if max(w["x1"] for w in ws) >= rend - 0.1 * rwidth]
+
+        def prose(full, total):
+            # 꽉 찬 줄이 충분하고, 줄마다 낱말이 여럿이며, 숫자보다 글자가 많아야 본문이다 (숫자 표는 아님)
+            if len(full) < max(3, 0.45 * total):
+                return False
+            if sum(len(ws) for ws in full) / len(full) < 4:
+                return False
+            text = "".join(w["text"] for ws in full for w in ws)
+            letters = sum(1 for ch in text if ch.isalpha())
+            return letters >= 0.6 * max(len(text), 1)
+
+        # 두 단 너비가 비슷해야 한다 (좁은 이름표 칸 + 넓은 설명 칸은 표 모양 배치)
+        balanced = 0.6 <= lwidth / rwidth <= 1 / 0.6
+        if not (balanced and prose(lfull, len(lrows)) and prose(rfull, len(rrows))):
+            out.append((items, False))
+            if tail:
+                out.append((tail, False))
+            continue
+        out.append((items, True))
+        if tail:
+            out.append((tail, False))
+    if not any(double for _, double in out):
+        return None
+    # 이웃한 한 단 구역은 합친다
+    merged = []
+    for items, double in out:
+        if merged and not double and not merged[-1][1]:
+            merged[-1] = (merged[-1][0] + items, False)
+        else:
+            merged.append((items, double))
+    layout = []
+    for i, (items, double) in enumerate(merged):
+        top = min(r["top"] for r, _ in items)
+        bottom = max(r["bottom"] for r, _ in items)
+        layout.append([top, bottom, split if double else None])
+    # 구역 경계는 이웃 구역 사이의 가운데로 잡는다 (글자 중심으로 구역을 가른다)
+    bounds = []
+    for i, seg in enumerate(layout):
+        lo = page.bbox[1] if i == 0 else (layout[i - 1][1] + seg[0]) / 2
+        hi = page.bbox[3] if i == len(layout) - 1 else (seg[1] + layout[i + 1][0]) / 2
+        bounds.append((lo, hi, seg[2]))
+    return bounds
+
+
 def _drop_nested(tables):
     """다른 표의 영역 안에 완전히 들어 있는 표(칸 안 글상자가 표로 잡힌 것)를 뺀다."""
     def inside(a, b):
@@ -1099,13 +1291,71 @@ def _page_blocks(page, shifts=None):
         return not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
 
     text_page = page.filter(outside) if boxes else page
+    # 쪽 위·아래 가장자리의 줄(머리말·꼬리말 후보)은 따로 떼어 둔다. 여러 쪽에 되풀이되면 assemble 에서 뺀다.
+    margins = []
+    if not rotated:
+        try:
+            height = page.bbox[3] - page.bbox[1]
+            top_zone, bottom_zone = page.bbox[1] + 0.07 * height, page.bbox[3] - 0.07 * height
+            all_lines = sorted(text_page.extract_text_lines(x_tolerance=tol, y_tolerance=ytol), key=lambda l: l["top"])
+            edge_lines = []
+            # 위쪽: 가장자리 띠 안에 있고 본문과 한 줄 높이 이상 떨어진 줄들만 (본문이 쪽 맨 위부터 시작하면 아님)
+            head = [ln for ln in all_lines if ln["bottom"] <= top_zone]
+            if head and len(head) < len(all_lines):
+                nxt = all_lines[len(head)]
+                if nxt["top"] - head[-1]["bottom"] >= max(head[-1]["bottom"] - head[-1]["top"], 1):
+                    edge_lines += head
+            foot = [ln for ln in all_lines if ln["top"] >= bottom_zone]
+            if foot and len(foot) < len(all_lines):
+                prev = all_lines[len(all_lines) - len(foot) - 1]
+                if foot[0]["top"] - prev["bottom"] >= max(foot[0]["bottom"] - foot[0]["top"], 1):
+                    edge_lines += foot
+            if edge_lines:
+                gone = {id(c) for ln in edge_lines for c in ln.get("chars", [])}
+                text_page = text_page.filter(lambda o: id(o) not in gone)
+                for ln in edge_lines:
+                    text, n = _CID.subn("", ln["text"])
+                    if text.strip():
+                        margins.append(("top" if ln["bottom"] <= top_zone else "bottom", ln["top"], text.strip()))
+        except Exception:
+            margins = []
+    layout = None
+    if not rotated:
+        try:
+            layout = _column_layout(text_page, tol, ytol)
+        except Exception:
+            layout = None
     items = []
-    for line in text_page.extract_text_lines(x_tolerance=tol, y_tolerance=ytol):
-        items.append((line["top"], "text", line))
+    if layout is None:
+        for line in text_page.extract_text_lines(x_tolerance=tol, y_tolerance=ytol):
+            items.append(((0, 0, line["top"]), "text", line))
+    else:
+        for i, (lo, hi, split) in enumerate(layout):
+            parts = [(0, None, None)] if split is None else [(0, None, split), (1, split, None)]
+            for col, left, right in parts:
+                def inside(obj, lo=lo, hi=hi, left=left, right=right):
+                    if "x0" not in obj or "top" not in obj:
+                        return True
+                    cy = (obj["top"] + obj["bottom"]) / 2
+                    cx = (obj["x0"] + obj["x1"]) / 2
+                    return lo <= cy < hi and (left is None or cx >= left) and (right is None or cx < right)
+
+                for line in text_page.filter(inside).extract_text_lines(x_tolerance=tol, y_tolerance=ytol):
+                    items.append(((i, col, line["top"]), "text", line))
+
+    def region(x0, top, x1, bottom):
+        if layout is None:
+            return (0, 0, top)
+        cy, cx = (top + bottom) / 2, (x0 + x1) / 2
+        for i, (lo, hi, split) in enumerate(layout):
+            if lo <= cy < hi:
+                return (i, 1 if split is not None and cx >= split else 0, top)
+        return (len(layout), 0, top)
+
     for bbox, rendered in prepared:
-        items.append((bbox[1], "table", rendered))
+        items.append((region(*bbox), "table", rendered))
     for top, text in vertical:
-        items.append((top, "table", text))
+        items.append(((region(0, top, 0, top)[0], 0, top) if layout else (0, 0, top), "table", text))
     items.sort(key=lambda x: x[0])
 
     blocks, para, last_bottom = [], [], None
@@ -1124,10 +1374,38 @@ def _page_blocks(page, shifts=None):
             columns_at[len(blocks)] = split
             blocks.append("")
         else:
-            blocks.append("\n".join(t for t, _ in para))
+            marks = [ln["x0"] for t, ln in para if t.startswith("\x01")]
+            if marks:
+                base = min(marks)
+                lines_out, in_list = [], False
+                for t, ln in para:
+                    if t.startswith("\x01"):
+                        level = max(0, round((ln["x0"] - base) / 12))
+                        if not in_list and lines_out:
+                            lines_out.append("")
+                        lines_out.append("  " * level + "- " + t[1:])
+                        in_list = True
+                    else:
+                        if in_list:
+                            lines_out.append("")
+                        lines_out.append(t)
+                        in_list = False
+                text = "\n".join(lines_out).strip("\n")
+                if blocks and lines_out and lines_out[0].lstrip().startswith("- ") and blocks[-1].split("\n")[-1].lstrip().startswith("- "):
+                    blocks[-1] += "\n" + text  # 줄 간격이 조금 넓은 목록이 여러 덩어리로 갈리지 않게
+                else:
+                    blocks.append(text)
+            else:
+                blocks.append("\n".join(t for t, _ in para))
         para.clear()
 
-    for _, kind, obj in items:
+    last_region = None
+    last_height = 0
+    for key, kind, obj in items:
+        if last_region is not None and key[:2] != last_region:
+            flush()  # 단·구역이 바뀌면 문단도 나눈다
+            last_bottom = None
+        last_region = key[:2]
         if kind == "table":
             flush()
             if obj:
@@ -1142,8 +1420,12 @@ def _page_blocks(page, shifts=None):
         height = max(obj["bottom"] - obj["top"], 1)
         if para and last_bottom is not None and obj["top"] - last_bottom > height * 0.8:
             flush()
+        bullet = _BULLET_LINE.match(text)
+        if bullet:
+            text = "\x01" + bullet.group(2)  # 글머리표 줄 (flush 에서 목록으로 바꾼다)
         para.append((text, obj))
         last_bottom = obj["bottom"]
+        last_height = height
     flush()
     # 잇달아 나온 나란한 묶음은 한 표의 행들로 모은다
     def width_of(block):
@@ -1176,6 +1458,9 @@ def _page_blocks(page, shifts=None):
             merged.append(rendered)
         grown = True
     blocks = merged
+    heads = [t for where, _, t in sorted(margins, key=lambda m: m[1]) if where == "top"]
+    feet = [t for where, _, t in sorted(margins, key=lambda m: m[1]) if where == "bottom"]
+    blocks = [_MARGIN + t for t in heads] + blocks + [_MARGIN + t for t in feet]
     if extra:
         blocks.append("\n".join(_CID.sub("", line) for line in extra))
     if lost[0]:
@@ -1204,17 +1489,82 @@ def convert_range(path, start, end):
     return out
 
 
+_SENTENCE_END = re.compile(r"[.!?。:;)\]」』”\"'…〉》>]$|[다요음함임됨것][.]?$")
+
+
+def _plain_block(block):
+    first = block.lstrip()
+    return bool(first) and not first.startswith(("|", "<", "#", ">", "- ", "* ", _MARGIN)) and not re.match(r"^\d+[.)] ", first)
+
+
+def _continues(prev, nxt):
+    """앞 쪽의 마지막 문단이 다음 쪽 첫 문단으로 이어지는가 (쪽 경계에서 끊긴 문단)."""
+    if not (_plain_block(prev) and _plain_block(nxt)):
+        return False
+    lines = prev.split("\n")
+    last = lines[-1].rstrip()
+    if _SENTENCE_END.search(last) or len(lines) < 2:
+        return False
+    # 마지막 줄이 다른 줄만큼 길어야(줄 끝까지 차 있어야) 다음 쪽으로 이어지는 문장이다
+    longest = max(len(ln) for ln in lines)
+    if len(last) < 0.85 * longest:
+        return False
+    # 다음 쪽 첫 줄도 문단의 일부여야 한다 (짧은 제목 한 줄은 이어지는 글이 아니다)
+    following = nxt.split("\n")
+    return len(following) >= 2
+
+
 def assemble(parts, total):
-    """convert_range 결과들을 하나의 본문으로 합친다."""
-    out = []
+    """convert_range 결과들을 하나의 본문으로 합친다.
+
+    여러 쪽에 되풀이되는 머리말·꼬리말(쪽 번호만 다른 것 포함)은 빼고, 쪽 경계에서 끊긴 문단은 앞 쪽에 잇는다.
+    """
+    pages = []
     for number, text in sorted(parts):
-        if not text:
+        blocks = [b for b in (text or "").split("\n\n") if b.strip()]
+        pages.append([number, blocks])
+    seen = {}
+    for number, blocks in pages:
+        for b in blocks:
+            if b.startswith(_MARGIN):
+                key = re.sub(r"\d+", "#", b[1:]).strip()
+                seen.setdefault(key, set()).add(number)
+    repeated = {k for k, nums in seen.items() if len(nums) >= 2}
+    dropped = []
+    edge = set()  # 쪽 가장자리에서 온 글 (머리말이 아니었어도 앞 쪽 문단에 잇지 않는다)
+    for page in pages:
+        kept = []
+        for b in page[1]:
+            if b.startswith(_MARGIN):
+                key = re.sub(r"\d+", "#", b[1:]).strip()
+                if key in repeated:
+                    if b[1:] not in dropped and len(dropped) < 2 and all(re.sub(r"\d+", "#", d) != key for d in dropped):
+                        dropped.append(b[1:])
+                    continue
+                b = b[1:]
+                kept.append(b)
+                edge.add(id(b))
+                continue
+            kept.append(b)
+        page[1] = kept
+    # 쪽 경계에서 끊긴 문단을 앞 쪽에 이어 붙인다
+    filled = [p for p in pages if p[1]]
+    for prev, nxt in zip(filled, filled[1:]):
+        if (prev[1] and nxt[1] and id(prev[1][-1]) not in edge and id(nxt[1][0]) not in edge
+                and _continues(prev[1][-1], nxt[1][0])):
+            prev[1][-1] += "\n" + nxt[1].pop(0)
+    out = []
+    if repeated:
+        shown = " / ".join(f"「{d}」" for d in dropped)
+        out.append(f"> 쪽마다 되풀이되는 머리말·꼬리말은 뺐습니다: {shown}")
+    for number, blocks in pages:
+        if not blocks:
             continue
         if total > 1:
             # 쪽 번호를 소제목으로 둔다: 옵시디언 개요(목차)에서 쪽으로 바로 가고 [[문서#12쪽]]으로 연결할 수 있다
             out.append(f"## {number}쪽")
-        out.append(text)
-    if not out:
+        out.append("\n\n".join(blocks))
+    if not out or (repeated and len(out) == 1):
         return EMPTY_NOTE
     return "\n\n".join(out)
 

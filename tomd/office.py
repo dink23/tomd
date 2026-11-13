@@ -50,6 +50,191 @@ def _split_sections(code):
     return parts
 
 
+_EPOCH_1900 = datetime.datetime(1899, 12, 30)
+_EPOCH_1904 = datetime.datetime(1904, 1, 1)
+# 엑셀 기본 날짜 형식(번호 14·22)은 화면에서 지역 설정을 따른다: 한국어 윈도에서는 2027-03-02
+_LOCALE_DATES = {"mm-dd-yy": "yyyy-mm-dd", "m/d/yy": "yyyy-mm-dd", "m/d/yyyy": "yyyy-mm-dd",
+                 "m/d/yy h:mm": "yyyy-mm-dd h:mm", "m/d/yy hh:mm": "yyyy-mm-dd hh:mm"}
+_DATE_TOKEN = re.compile(
+    r'"[^"]*"|\\.|\[[^\]]*\]|_.|\*.|yyyy|yy|y|e|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|aaaa|aaa|'
+    r'hh|h|ss|s|am/pm|a/p|上午/下午|오전/오후|\.0+|.',
+    re.I,
+)
+_WEEK_KO = "월화수목금토일"
+_WEEK_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_MONTH_EN = ("January", "February", "March", "April", "May", "June", "July", "August",
+             "September", "October", "November", "December")
+
+
+def _serial(value, date1904=False):
+    """날짜·시각 값을 엑셀 일련번호(일 단위 수)로."""
+    base = _EPOCH_1904 if date1904 else _EPOCH_1900
+    if isinstance(value, datetime.datetime):
+        return (value - base).total_seconds() / 86400
+    if isinstance(value, datetime.date):
+        return (datetime.datetime(value.year, value.month, value.day) - base).days
+    if isinstance(value, datetime.time):
+        return (value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1e6) / 86400
+    if isinstance(value, datetime.timedelta):
+        return value.total_seconds() / 86400
+    return float(value)
+
+
+def _is_date_code(code):
+    return _is_date_format(code) and not re.search(r"E[+-]", code or "")
+
+
+def _date_text(value, code, date1904=False):
+    """날짜·시각을 엑셀 서식 그대로 (yyyy"년" m"월" d"일", m/d, hh:mm, [h]:mm, 오전/오후 …)."""
+    code = _LOCALE_DATES.get((code or "").lower(), code)
+    serial = _serial(value, date1904)
+    section = _split_sections(code)[0]
+    base = _EPOCH_1904 if date1904 else _EPOCH_1900
+    seconds = round(serial * 86400)
+    moment = base + datetime.timedelta(seconds=seconds)
+    tokens = _DATE_TOKEN.findall(section)
+    lowered = [t.lower() for t in tokens]
+    korean = bool(re.search(r"\[\$-(?:0*412|ko)", section, re.I))  # 한국어 지역 서식이면 요일도 한국어
+    ampm = any(t in ("am/pm", "a/p", "오전/오후", "上午/下午") for t in lowered)
+    kinds = []  # 날짜·시각 자리표시자만 (분/월 구분용)
+    for i, t in enumerate(lowered):
+        if t[:1] in "ymdhs" and not t.startswith(("[", '"')) or re.fullmatch(r"\[(h+|m+|s+)\]", t):
+            kinds.append(i)
+    out = []
+    for i, (t, low) in enumerate(zip(tokens, lowered)):
+        if low.startswith('"'):
+            out.append(t[1:-1])
+        elif low.startswith("\\"):
+            out.append(t[1:])
+        elif low.startswith("["):
+            elapsed = re.fullmatch(r"\[(h+|m+|s+)\]", low)
+            if elapsed:
+                unit = elapsed.group(1)
+                total = {"h": seconds // 3600, "m": seconds // 60, "s": seconds}[unit[0]]
+                out.append(str(int(total)).zfill(len(unit)))
+            elif low.startswith("[$") and "-" in low:
+                out.append(t[2:-1].split("-", 1)[0])
+            # [Red] 같은 색·조건은 보이지 않는다
+        elif low.startswith(("_", "*")):
+            continue
+        elif low in ("yyyy", "e"):
+            out.append(f"{moment.year:04d}")
+        elif low in ("yy", "y"):
+            out.append(f"{moment.year % 100:02d}")
+        elif low[:1] == "m" and low.strip("m") == "":
+            pos = kinds.index(i) if i in kinds else -1
+            prev_k = lowered[kinds[pos - 1]] if pos > 0 else ""
+            next_k = lowered[kinds[pos + 1]] if 0 <= pos < len(kinds) - 1 else ""
+            minute = len(low) <= 2 and (prev_k.lstrip("[")[:1] == "h" or next_k[:1] == "s")
+            if minute:
+                out.append(f"{moment.minute:0{len(low)}d}")
+            elif len(low) == 1:
+                out.append(str(moment.month))
+            elif len(low) == 2:
+                out.append(f"{moment.month:02d}")
+            elif len(low) == 3:
+                out.append(_MONTH_EN[moment.month - 1][:3])
+            elif len(low) == 4:
+                out.append(_MONTH_EN[moment.month - 1])
+            else:
+                out.append(_MONTH_EN[moment.month - 1][0])
+        elif low == "d":
+            out.append(str(moment.day))
+        elif low == "dd":
+            out.append(f"{moment.day:02d}")
+        elif low == "ddd":
+            out.append(_WEEK_KO[moment.weekday()] if korean else _WEEK_EN[moment.weekday()][:3])
+        elif low == "dddd":
+            out.append(_WEEK_KO[moment.weekday()] + "요일" if korean else _WEEK_EN[moment.weekday()])
+        elif low == "aaa":
+            out.append(_WEEK_KO[moment.weekday()])
+        elif low == "aaaa":
+            out.append(_WEEK_KO[moment.weekday()] + "요일")
+        elif low in ("h", "hh"):
+            hour = moment.hour
+            if ampm:
+                hour = hour % 12 or 12
+            out.append(f"{hour:0{len(low)}d}")
+        elif low in ("s", "ss"):
+            out.append(f"{moment.second:0{len(low)}d}")
+        elif low.startswith(".0"):
+            frac = serial * 86400 - int(serial * 86400)
+            out.append("." + f"{frac:.{len(low) - 1}f}"[2:])
+        elif low in ("am/pm", "a/p"):
+            pm = moment.hour >= 12
+            word = ("PM" if pm else "AM") if low == "am/pm" else ("P" if pm else "A")
+            out.append(word if t[0].isupper() else word.lower())
+        elif low == "오전/오후":
+            out.append("오후" if moment.hour >= 12 else "오전")
+        elif low == "上午/下午":
+            out.append("下午" if moment.hour >= 12 else "上午")
+        else:
+            out.append(t)
+    return "".join(out).strip()
+
+
+def _fraction_text(value, section):
+    """# ?/? 같은 분수 서식."""
+    from fractions import Fraction
+
+    body = re.sub(r'"[^"]*"|\[[^\]]*\]|_.|\*.', "", section).strip()
+    m = re.match(r"^([#0?,]*)\s*([#0?]+)\s*/\s*([#0?]+|\d+)$", body)
+    if not m:
+        return None
+    whole_fmt, den_fmt = m.group(1), m.group(3)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    whole = int(value) if whole_fmt else 0
+    rest = value - whole
+    if den_fmt.isdigit():
+        den = int(den_fmt)
+        num = round(rest * den)
+    else:
+        frac = Fraction(rest).limit_denominator(10 ** len(den_fmt) - 1)
+        num, den = frac.numerator, frac.denominator
+    if num == den:
+        whole, num = whole + 1, 0
+    if num == 0:
+        return f"{sign}{whole}"
+    head = f"{whole} " if whole else ""
+    return f"{sign}{head}{num}/{den}".strip()
+
+
+def _exponent_text(value, section):
+    """0.00E+00 같은 지수 서식."""
+    body = re.sub(r'"[^"]*"|\[[^\]]*\]|_.|\*.', "", section).strip()
+    m = re.match(r"^([#0]*)(?:\.([#0]*))?E([+-])([#0]+)$", body, re.I)
+    if not m:
+        return None
+    decimals = len(m.group(2) or "")
+    digits = len(m.group(4))
+    mantissa, exponent = f"{value:.{decimals}E}".split("E")
+    exp = int(exponent)
+    sign = "-" if exp < 0 else ("+" if m.group(3) == "+" else "")
+    return f"{mantissa}E{sign}{abs(exp):0{digits}d}"
+
+
+def _cell_text(value, code, date1904=False):
+    """칸 값을 엑셀 화면에 보이는 모양대로."""
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)):
+        if code and _is_date_code(code):
+            try:
+                return _date_text(value, code, date1904)
+            except Exception:
+                pass
+        if isinstance(value, datetime.time):
+            return value.strftime("%H:%M") if not value.second else value.strftime("%H:%M:%S")
+        if isinstance(value, datetime.timedelta):
+            return str(value)
+        return _fmt(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and code and _is_date_code(code):
+        try:
+            return _date_text(value, code, date1904)
+        except Exception:
+            return _fmt(value)
+    return _number_text(value, code)
+
+
 def _number_text(value, code):
     """엑셀 화면에 보이는 모양대로 숫자를 쓴다 (쉼표, 퍼센트, 소수 자릿수, △·명·원 같은 앞뒤 글자)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -92,8 +277,14 @@ def _number_text(value, code):
         if not holders:
             text = literal(tokens).strip()
             return text or _fmt(value)
-        if any(t.lower() in ("e", "y", "m", "d", "h", "s", "/") for t in tokens):
-            return _fmt(value)  # 지수·날짜·분수 형식은 값 그대로
+        if "/" in tokens:
+            text = _fraction_text(-value if sign else value, section)
+            return text if text is not None else _fmt(-value if sign else value)
+        if any(t.lower() == "e" for t in tokens):
+            text = _exponent_text(value, section)
+            return (sign + text) if text is not None else _fmt(-value if sign else value)
+        if any(t.lower() in ("y", "m", "d", "h", "s") for t in tokens):
+            return _fmt(-value if sign else value)
         start, end = holders[0], holders[-1]
         while start > 0 and tokens[start - 1] in (".", ","):
             start -= 1
@@ -154,16 +345,53 @@ def _sheet_md(title, values, merges):
     return out
 
 
+def _link_text(text, target=None, location=None):
+    """칸에 걸린 링크: 바깥 주소는 [글](주소), 문서 안 위치는 글 (→ 시트!칸)."""
+    if target:
+        return f"[{text}]({target.replace(' ', '%20').replace(')', '%29')})"
+    if location:
+        return f"{text} (→ {location.replace(chr(39), '')})"
+    return text
+
+
+def _hidden_note(rows, cols):
+    parts = []
+    if rows:
+        parts.append(f"숨긴 행 {rows}개")
+    if cols:
+        parts.append(f"숨긴 열 {cols}개")
+    return f"> {'와 '.join(parts)}는 변환하지 않았습니다 (엑셀 화면에 보이는 내용만 옮김)." if parts else ""
+
+
+def _drop_hidden(values, merges, hidden_rows, hidden_cols):
+    """숨긴 행·열의 칸을 뺀다. 글이 있던 숨긴 행·열 수를 함께 돌려준다."""
+    gone_r = {r for r, c in values if r in hidden_rows}
+    gone_c = {c for r, c in values if c in hidden_cols}
+    if not gone_r and not gone_c:
+        return values, merges, "", 0
+    kept = {k: v for k, v in values.items() if k[0] not in hidden_rows and k[1] not in hidden_cols}
+    return kept, merges, _hidden_note(len(gone_r), len(gone_c)), 1
+
+
+def _hidden_sheets_note(names):
+    if not names:
+        return ""
+    return f"> 숨긴 시트 {len(names)}개({', '.join(names)})는 변환하지 않았습니다."
+
+
 def _xlsx_openpyxl(path):
     import openpyxl
     from openpyxl.reader import excel as excel_reader
+    from openpyxl.utils import column_index_from_string
 
     # 차트·그림은 변환하지 않는다. 일부 차트에서 openpyxl이 읽다가 멈추므로 아예 읽지 않는다.
     excel_reader.find_images = lambda *args, **kwargs: ([], [])
     wb = openpyxl.load_workbook(path, data_only=True)
-    sheets = []
+    date1904 = bool(getattr(getattr(wb, "epoch", None), "year", 1900) == 1904)
+    sheets, hidden_sheets = [], []
     for ws in wb.worksheets:
         if ws.sheet_state != "visible":
+            hidden_sheets.append(ws.title)
             continue
         # 실제로 있는 칸만 본다. 맨 아래 행·맨 오른쪽 열에 서식만 있는 파일에서
         # 사용 영역 전체(최대 100만 행)를 훑다가 멈추지 않도록.
@@ -172,12 +400,26 @@ def _xlsx_openpyxl(path):
             stored = {(c.row, c.column): c for row in ws.iter_rows() for c in row}
         values = {}
         for key, cell in list(stored.items()):
-            text = _number_text(cell.value, getattr(cell, "number_format", None))
+            text = _cell_text(cell.value, getattr(cell, "number_format", None), date1904)
             if text:
+                link = getattr(cell, "hyperlink", None)
+                if link is not None and (link.target or link.location):
+                    text = _link_text(text, link.target, link.location)
                 values[key] = text
         merges = [(m.min_row, m.min_col, m.max_row, m.max_col) for m in ws.merged_cells.ranges]
-        sheets.append((ws.title, values, merges))
-    return sheets
+        hidden_rows = {r for r, dim in ws.row_dimensions.items() if dim.hidden}
+        hidden_cols = set()
+        for letter, dim in ws.column_dimensions.items():
+            if dim.hidden:
+                try:
+                    lo = dim.min or column_index_from_string(letter)
+                    hi = dim.max or lo
+                except Exception:
+                    continue
+                hidden_cols.update(range(lo, hi + 1))
+        values, merges, note, _ = _drop_hidden(values, merges, hidden_rows, hidden_cols)
+        sheets.append((ws.title, values, merges, note))
+    return sheets, hidden_sheets
 
 
 _DATE_IDS = set(range(14, 23)) | set(range(27, 37)) | set(range(45, 48)) | set(range(50, 59))
@@ -253,6 +495,7 @@ def _xlsx_raw(path):
             for i, fid in enumerate(xfs):
                 if (fid.isdigit() and int(fid) in _DATE_IDS and fid not in custom) or _is_date_format(custom.get(fid)):
                     date_styles.add(str(i))
+                    style_codes[str(i)] = custom.get(fid) or ("hh:mm" if fid in ("18", "19", "20", "21") else "yyyy-mm-dd")
                 else:
                     style_codes[str(i)] = custom.get(fid) or _BUILTIN_FORMATS.get(fid)
 
@@ -269,9 +512,12 @@ def _xlsx_raw(path):
             n = n * 26 + ord(ch) - 64
         return n
 
-    sheets = []
+    sheets, hidden_sheets = [], []
     for el in root.iter():
-        if local(el.tag) != "sheet" or attr(el, "state") in ("hidden", "veryHidden"):
+        if local(el.tag) != "sheet":
+            continue
+        if attr(el, "state") in ("hidden", "veryHidden"):
+            hidden_sheets.append(attr(el, "name") or "")
             continue
         rid = attr(el, "id")
         if rid not in book_rels:
@@ -280,6 +526,7 @@ def _xlsx_raw(path):
         if part not in names:
             continue
         values, merges = {}, []
+        hidden_rows, hidden_cols = set(), set()
         row, col = 0, 0
         for event, node in ET.iterparse(z.open(part), events=("start", "end")):
             tag = local(node.tag)
@@ -287,6 +534,13 @@ def _xlsx_raw(path):
                 if tag == "row":
                     row = int(attr(node, "r") or row + 1)
                     col = 0
+                    if attr(node, "hidden") in ("1", "true"):
+                        hidden_rows.add(row)
+                elif tag == "col" and attr(node, "hidden") in ("1", "true"):
+                    try:
+                        hidden_cols.update(range(int(attr(node, "min")), int(attr(node, "max")) + 1))
+                    except (TypeError, ValueError):
+                        pass
                 continue
             if tag == "c":
                 ref = attr(node, "r")
@@ -317,7 +571,10 @@ def _xlsx_raw(path):
                         else:
                             style = attr(node, "s")
                             if style in date_styles:
-                                text = _fmt(as_date(number))
+                                try:
+                                    text = _date_text(number, style_codes.get(style), date1904)
+                                except Exception:
+                                    text = _fmt(as_date(number))
                             else:
                                 if number.is_integer() and abs(number) < 2 ** 53:
                                     number = int(number)
@@ -331,8 +588,9 @@ def _xlsx_raw(path):
                     merges.append((int(m.group(2)), col_number(m.group(1)), int(m.group(4)), col_number(m.group(3))))
             elif tag == "row":
                 node.clear()
-        sheets.append((attr(el, "name") or "", values, merges))
-    return sheets
+        values, merges, note, _ = _drop_hidden(values, merges, hidden_rows, hidden_cols)
+        sheets.append((attr(el, "name") or "", values, merges, note))
+    return sheets, hidden_sheets
 
 
 def _xlsx_drawings(path):
@@ -411,10 +669,10 @@ def convert_xlsx(path):
                     raise ValueError("암호가 걸린 엑셀 파일입니다. 엑셀에서 암호를 해제해 저장한 뒤 다시 변환하세요.")
         return convert_xls(path)  # 확장자만 xlsx인 예전 형식(xls)
     try:
-        sheets = _xlsx_openpyxl(path)
+        sheets, hidden_sheets = _xlsx_openpyxl(path)
     except Exception as first:
         try:
-            sheets = _xlsx_raw(path)
+            sheets, hidden_sheets = _xlsx_raw(path)
         except Exception:
             raise first
     try:
@@ -422,14 +680,18 @@ def convert_xlsx(path):
     except Exception:
         drawings = {}
     out = []
-    for title, values, merges in sheets:
+    for title, values, merges, note in sheets:
         out.extend(_sheet_md(title, values, merges))
+        if note:
+            out.append(note)
         charts, pictures, texts = drawings.get(title, (0, 0, []))
         notes = [f"차트 {charts}개" if charts else "", f"그림 {pictures}개" if pictures else ""]
         if any(notes):
             out.append("[" + ", ".join(n for n in notes if n) + "]")
         if texts:
             out.append("도형·단추 속 글:\n\n" + "\n".join(f"- {t}" for t in texts))
+    if _hidden_sheets_note(hidden_sheets):
+        out.append(_hidden_sheets_note(hidden_sheets))
     from . import vba
 
     macros = vba.markdown(path)
@@ -471,10 +733,16 @@ def convert_xls(path):
         raise
     except Exception:
         book, formatted = open_book(), False
-    out = []
+    out, hidden_sheets = [], []
     for index, sheet in enumerate(book.sheets()):
         if getattr(sheet, "visibility", 0):
-            continue  # 숨긴 시트
+            hidden_sheets.append(sheet.name)  # 숨긴 시트
+            continue
+        links = {}
+        for link in getattr(sheet, "hyperlink_list", None) or []:
+            for r in range(link.frowx, link.lrowx + 1):
+                for c in range(link.fcolx, link.lcolx + 1):
+                    links[(r, c)] = link
         values = {}
         for r in range(sheet.nrows):
             for c in range(sheet.ncols):
@@ -487,11 +755,19 @@ def convert_xls(path):
                     except Exception:
                         code = None
                 if cell.ctype == xlrd.XL_CELL_DATE:
-                    try:
-                        value = xlrd.xldate_as_datetime(value, book.datemode)
-                    except Exception:
-                        pass
-                    text = _fmt(value)
+                    if code and _is_date_code(code):
+                        try:
+                            text = _date_text(value, code, book.datemode == 1)
+                        except Exception:
+                            text = ""
+                    else:
+                        text = ""
+                    if not text:
+                        try:
+                            value = xlrd.xldate_as_datetime(value, book.datemode)
+                        except Exception:
+                            pass
+                        text = _fmt(value)
                 elif cell.ctype == xlrd.XL_CELL_NUMBER:
                     if float(value).is_integer() and abs(value) < 2 ** 53:
                         value = int(value)
@@ -503,9 +779,20 @@ def convert_xls(path):
                 else:
                     text = _fmt(value)
                 if text:
+                    link = links.get((r, c))
+                    if link is not None and (link.url_or_path or link.textmark):
+                        url = link.url_or_path if link.type in ("url", "unc") or (link.url_or_path or "").startswith(("http", "mailto")) else None
+                        text = _link_text(text, url, None if url else (link.textmark or link.url_or_path))
                     values[(r + 1, c + 1)] = text
         merges = [(r0 + 1, c0 + 1, r1, c1) for r0, r1, c0, c1 in (sheet.merged_cells if formatted else [])]
+        hidden_rows = {r + 1 for r, info in (getattr(sheet, "rowinfo_map", None) or {}).items() if getattr(info, "hidden", 0)}
+        hidden_cols = {c + 1 for c, info in (getattr(sheet, "colinfo_map", None) or {}).items() if getattr(info, "hidden", 0)}
+        values, merges, note, _ = _drop_hidden(values, merges, hidden_rows, hidden_cols)
         out.extend(_sheet_md(sheet.name, values, merges))
+        if note:
+            out.append(note)
+    if _hidden_sheets_note(hidden_sheets):
+        out.append(_hidden_sheets_note(hidden_sheets))
     from . import vba
 
     macros = vba.markdown(path)
@@ -910,19 +1197,190 @@ def _para_text(para):
     return re.sub(r" {2,}", " ", (para.text or "").replace("\x0b", " ")).strip()
 
 
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_ROMAN = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+          (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))
+
+
+def _roman(n):
+    out = ""
+    for value, letters in _ROMAN:
+        while n >= value:
+            out += letters
+            n -= value
+    return out
+
+
+def _alpha(n):
+    out = ""
+    while n > 0:
+        n, rest = divmod(n - 1, 26)
+        out = chr(97 + rest) + out
+    return out
+
+
+def _num_label(kind, n):
+    """자동 번호 종류(buAutoNum type)에 맞는 번호 글자."""
+    kind = kind or "arabicPeriod"
+    if kind.startswith("alphaLc"):
+        core = _alpha(n)
+    elif kind.startswith("alphaUc"):
+        core = _alpha(n).upper()
+    elif kind.startswith("romanLc"):
+        core = _roman(n)
+    elif kind.startswith("romanUc"):
+        core = _roman(n).upper()
+    elif kind.startswith("circleNum") and 1 <= n <= 20:
+        return chr(0x2460 + n - 1)
+    else:
+        core = str(n)
+    if kind.endswith("ParenBoth"):
+        return f"({core})"
+    if kind.endswith("ParenR"):
+        return f"{core})"
+    if kind.endswith("Plain"):
+        return core
+    return f"{core}."
+
+
+def _slide_target(part, rid):
+    """글자·도형에 건 링크가 가리키는 곳: ('url', 주소) 또는 ('slide', 번호)."""
+    try:
+        rel = part.rels[rid]
+    except Exception:
+        return None
+    if rel.is_external:
+        return ("url", rel.target_ref)
+    try:
+        target = rel.target_part
+        slides = part.package.presentation_part.presentation.slides
+        for i, sl in enumerate(slides, 1):
+            if sl.part is target:
+                return ("slide", i)
+    except Exception:
+        pass
+    return None
+
+
+def _linked(text, target):
+    if not target or not text.strip():
+        return text
+    kind, where = target
+    if kind == "url":
+        return f"[{text}]({where.replace(' ', '%20').replace(')', '%29')})"
+    return f"{text} (→ 슬라이드 {where})"
+
+
+def _para_md(para, part):
+    """문단 하나의 글: 링크는 [글](주소), 한 문단 안에서 일부만 굵게·기울임이면 **·* 로 표시한다."""
+    pieces = []  # (글, 굵게, 기울임, 링크)
+    for node in para._p:
+        tag = node.tag
+        if tag == _A + "r" or tag == _A + "fld":
+            t = node.find(_A + "t")
+            text = (t.text or "") if t is not None else ""
+            rpr = node.find(_A + "rPr")
+            bold = italic = False
+            link = None
+            if rpr is not None:
+                bold = rpr.get("b") in ("1", "true")
+                italic = rpr.get("i") in ("1", "true")
+                click = rpr.find(_A + "hlinkClick")
+                if click is not None and click.get(_R_ID):
+                    link = _slide_target(part, click.get(_R_ID))
+            pieces.append([text.replace("\x0b", " "), bold, italic, link])
+        elif tag == _A + "br":
+            pieces.append([" ", False, False, None])
+    if not pieces:
+        return _para_text(para)
+    solid = [p for p in pieces if p[0].strip()]
+    mixed_b = len({p[1] for p in solid}) > 1
+    mixed_i = len({p[2] for p in solid}) > 1
+    # 이웃한 같은 모양 조각을 합친다 (한 낱말이 여러 조각으로 저장되는 일이 흔하다)
+    merged = []
+    for p in pieces:
+        key = (p[1] and mixed_b, p[2] and mixed_i, p[3])
+        # 빈칸만 있는 조각은 앞 조각의 모양을 따른다 (굵은 두 낱말 사이 빈칸 때문에 ** 가 쪼개지지 않게)
+        if merged and (merged[-1][1] == key or (not p[0].strip() and p[3] is None)):
+            merged[-1][0] += p[0]
+        else:
+            merged.append([p[0], key])
+    out = ""
+    for i, (text, (bold, italic, link)) in enumerate(merged):
+        core = text.strip()
+        if not core:
+            out += text
+            continue
+        lead = text[: len(text) - len(text.lstrip())]
+        tail = text[len(text.rstrip()):]
+        mark = ("**" if bold else "") + ("*" if italic else "")
+        before = out[-1:] if not lead else " "
+        after = (merged[i + 1][0][:1] if i + 1 < len(merged) else "") if not tail else " "
+        # 마크다운은 문장부호로 끝나는 강조 바로 뒤에 글자가 붙으면 강조로 읽지 않는다: 그럴 땐 표시하지 않는다
+        if mark and ((not core[-1].isalnum() and after.isalnum()) or (not core[0].isalnum() and before.isalnum())):
+            mark = ""
+        core = f"{mark}{core}{mark[::-1]}"
+        out += lead + _linked(core, link) + tail
+    return re.sub(r" {2,}", " ", out).strip()
+
+
+def _bullet_kind(para):
+    """문단에 직접 지정한 글머리 모양: ('none'|'char'|'num', 번호 종류, 시작 번호) 또는 None(물려받음)."""
+    ppr = para._p.find(_A + "pPr")
+    if ppr is None:
+        return None
+    if ppr.find(_A + "buNone") is not None:
+        return ("none", None, None)
+    num = ppr.find(_A + "buAutoNum")
+    if num is not None:
+        start = num.get("startAt")
+        return ("num", num.get("type"), int(start) if start and start.isdigit() else None)
+    if ppr.find(_A + "buChar") is not None or ppr.find(_A + "buBlip") is not None:
+        return ("char", None, None)
+    return None
+
+
+def _shape_link(shape):
+    """도형 전체에 건 링크(누르면 다른 슬라이드·주소로 이동)."""
+    try:
+        cnv = shape._element.find(".//" + "{http://schemas.openxmlformats.org/presentationml/2006/main}cNvPr")
+        click = cnv.find(_A + "hlinkClick") if cnv is not None else None
+        if click is not None and click.get(_R_ID):
+            return _slide_target(shape.part, click.get(_R_ID))
+    except Exception:
+        pass
+    return None
+
+
 def _text_frame_md(shape):
-    """글상자 하나를 마크다운으로. 목록이면 글머리표, 아니면 줄글로 만든다."""
-    paras = [(p.level or 0, _para_text(p)) for p in shape.text_frame.paragraphs]
-    paras = [(lv, t) for lv, t in paras if t]
+    """글상자 하나를 마크다운으로. 목록이면 글머리표·번호, 아니면 줄글로 만든다."""
+    try:
+        part = shape.part
+    except Exception:
+        part = None
+    paras = []
+    for p in shape.text_frame.paragraphs:
+        text = _para_md(p, part) if part is not None else _para_text(p)
+        if text:
+            paras.append((p.level or 0, text, _bullet_kind(p)))
     if not paras:
         return ""
+    link = _shape_link(shape)
+    if link is not None and not any("](" in t or "(→ 슬라이드" in t for _, t, _ in paras):
+        last = paras[-1]
+        paras[-1] = (last[0], _linked(last[1], link), last[2])
+    glyphs = sum(1 for _, t, _ in paras if _BULLET.match(t))
+    # 글머리 기호를 글자로 직접 쓴 목록 (한 문단짜리 '▶ 이동' 단추 글은 목록이 아니다)
+    marked = glyphs >= 1 and len(paras) >= 2
+    if not marked and any(k is not None and k[0] in ("char", "num") for _, _, k in paras):
+        return _explicit_list_md(paras)
     body = _ph_type(shape) in ("BODY", "OBJECT", "SUBTITLE") and len(paras) > 1
-    marked = any(_BULLET.match(t) for _, t in paras)
     if not body and not marked:
         # 목록이 아닌 글상자: 문단마다 줄을 바꿔 한 덩어리로
-        return "  \n".join(t.replace("\n", "  \n") for _, t in paras)
+        return "  \n".join(t.replace("\n", "  \n") for _, t, _ in paras)
     lines, seen_marker = [], False
-    for level, text in paras:
+    for level, text, kind in paras:
         flat = " ".join(text.split("\n"))
         if marked:
             if _BULLET.match(flat):
@@ -936,6 +1394,40 @@ def _text_frame_md(shape):
         else:
             lines.append("  " * level + "- " + flat)
     return "\n".join(lines).rstrip()
+
+
+def _explicit_list_md(paras):
+    """글머리표·자동 번호를 직접 지정한 문단들. 번호는 단계별로 이어 세고, 시작 번호가 있으면 따른다."""
+    lines = []
+    counters = {}  # 단계 -> (번호 종류, 지금 번호)
+    in_list = False
+    for level, text, kind in paras:
+        flat = " ".join(text.split("\n"))
+        for deeper in [lv for lv in counters if lv > level]:
+            del counters[deeper]
+        if kind is None or kind[0] == "none":
+            if in_list:
+                lines.append("")
+            lines.append(flat)
+            lines.append("")
+            in_list = False
+            continue
+        indent = "   " * level
+        if kind[0] == "char":
+            lines.append(indent + "- " + flat)
+        else:
+            _, style, start = kind
+            prev = counters.get(level)
+            if start is not None:
+                n = start
+            elif prev is not None and prev[0] == style:
+                n = prev[1] + 1
+            else:
+                n = 1
+            counters[level] = (style, n)
+            lines.append(f"{indent}{_num_label(style, n)} {flat}")
+        in_list = True
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def _guess_title(slide, slide_height):

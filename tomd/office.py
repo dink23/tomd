@@ -372,12 +372,25 @@ def _xlsx_drawings(path):
             if local(el.tag) != "sheet" or attr(el, "id") not in book_rels:
                 continue
             charts = pictures = 0
+            texts = []  # 도형·글상자·단추 속 글
             for kind, drawing in rels_of(book_rels[attr(el, "id")][1]).values():
                 if not kind.endswith("/drawing") or drawing not in names:
                     continue
                 charts += sum(1 for t, _ in rels_of(drawing).values() if t.endswith("/chart"))
-                pictures += sum(1 for n in ET.fromstring(z.read(drawing)).iter() if local(n.tag) == "pic")
-            found[attr(el, "name") or ""] = (charts, pictures)
+                tree = ET.fromstring(z.read(drawing))
+                pictures += sum(1 for n in tree.iter() if local(n.tag) == "pic")
+                for shape in tree.iter():
+                    if local(shape.tag) != "sp":
+                        continue
+                    paras = []
+                    for p in shape.iter():
+                        if local(p.tag) == "p":
+                            line = "".join(t.text or "" for t in p.iter() if local(t.tag) == "t").strip()
+                            if line:
+                                paras.append(re.sub(r"\s+", " ", line))
+                    if paras:
+                        texts.append(" ".join(paras))
+            found[attr(el, "name") or ""] = (charts, pictures, texts)
     return found
 
 
@@ -410,10 +423,17 @@ def convert_xlsx(path):
     out = []
     for title, values, merges in sheets:
         out.extend(_sheet_md(title, values, merges))
-        charts, pictures = drawings.get(title, (0, 0))
+        charts, pictures, texts = drawings.get(title, (0, 0, []))
         notes = [f"차트 {charts}개" if charts else "", f"그림 {pictures}개" if pictures else ""]
         if any(notes):
             out.append("[" + ", ".join(n for n in notes if n) + "]")
+        if texts:
+            out.append("도형·단추 속 글:\n\n" + "\n".join(f"- {t}" for t in texts))
+    from . import vba
+
+    macros = vba.markdown(path)
+    if macros:
+        out.append(macros)
     return "\n\n".join(out)
 
 
@@ -485,6 +505,11 @@ def convert_xls(path):
                     values[(r + 1, c + 1)] = text
         merges = [(r0 + 1, c0 + 1, r1, c1) for r0, r1, c0, c1 in (sheet.merged_cells if formatted else [])]
         out.extend(_sheet_md(sheet.name, values, merges))
+    from . import vba
+
+    macros = vba.markdown(path)
+    if macros:
+        out.append(macros)
     return "\n\n".join(out)
 
 

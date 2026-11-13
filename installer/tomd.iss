@@ -67,10 +67,25 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.docx\shell\ToMD"; 
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.docx\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.docx\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.docx\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.odt\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "마크다운(MD)으로 변환"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.odt\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.odt\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.odt\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%1"""
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "마크다운(MD)으로 변환"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.html\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "마크다운(MD)으로 변환"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.html\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.html\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.html\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.htm\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "마크다운(MD)으로 변환"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.htm\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.htm\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.htm\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "이 폴더의 문서를 마크다운(MD)으로 변환"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\ToMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tomd.exe"" ""%V"""
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\ToMD"; ValueType: string; ValueName: ""; ValueData: "폴더 안 문서를 마크다운(MD)으로 변환"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\ToMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\tomd.exe"
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\ToMD"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"

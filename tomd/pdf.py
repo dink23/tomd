@@ -328,6 +328,7 @@ def _keep_stream_order(chars):
 # Symbol·Wingdings 계열 글꼴의 글머리 기호는 사용자 영역 문자(U+F0xx)로 나온다
 _SYMBOL_GLYPHS = {0xF0B7: "•", 0xF0A7: "▪", 0xF06C: "●", 0xF06E: "■", 0xF071: "□", 0xF0A8: "◦",
                   0xF0D8: "➢", 0xF0FC: "✓", 0xF076: "❖", 0xF0E0: "→", 0xF0E8: "➔", 0xF0A1: "○"}
+_NOTE_START = ("(", "（", "※", "*", "<", "〈", "[")
 _MARGIN = "\x02"  # 쪽 가장자리 줄 표시 (assemble 에서 머리말·꼬리말인지 가린다)
 _BULLET_LINE = re.compile(r"^(•)\s*(.*)$")  # □ ○ ◦ - 같은 한국 문서의 단계 기호는 그대로 둔다
 
@@ -1547,6 +1548,52 @@ def assemble(parts, total):
                 continue
             kept.append(b)
         page[1] = kept
+    # 쪽 맨 위·맨 아래 두 덩어리 안의 한 줄짜리 글 가운데 (1) 가장자리에서 찾은 머리말·꼬리말과 같은 것,
+    # (2) 여러 쪽(쪽 수의 60% 이상)에 글자 그대로 되풀이되는 것은 머리말·꼬리말로 보고 뺀다.
+    def single(text):
+        return "\n" not in text and _plain_block(text) and len(text) <= 80 and not text.lstrip().startswith(_NOTE_START)
+
+    def edges(blocks):
+        # 맨 위·맨 아래에서 이어지는 한 줄짜리 덩어리 (가장자리부터 최대 2개)
+        top = [i for i in range(min(2, len(blocks)))]
+        bottom = [i for i in range(len(blocks) - 1, max(-1, len(blocks) - 3), -1)]
+        out = []
+        for run in (top, bottom):
+            for i in run:
+                if not single(blocks[i]):
+                    break
+                out.append(i)
+        return sorted(set(out))
+
+    def is_running(text):
+        return text in running or re.sub(r"\d+", "#", text) in repeated
+
+    used = [p for p in pages if p[1]]
+    counts = {}
+    for _, blocks in used:
+        for text in {blocks[i].strip() for i in edges(blocks)}:
+            counts[text] = counts.get(text, 0) + 1
+    running = {t for t, c in counts.items() if c >= 2 and c >= 0.6 * len(used)} if len(used) >= 2 else set()
+    first_seen = set()
+    for page in used:
+        blocks = page[1]
+        gone = set()
+        # 가장자리에서 안쪽으로, 머리말·꼬리말이 아닌 덩어리를 만나면 멈춘다
+        top = [i for i in range(min(2, len(blocks)))]
+        bottom = [i for i in range(len(blocks) - 1, max(-1, len(blocks) - 3), -1)]
+        for run in (top, bottom):
+            for i in run:
+                text = blocks[i].strip()
+                if not single(blocks[i]) or not is_running(text):
+                    break
+                if text in running and text not in first_seen:
+                    first_seen.add(text)  # 처음 나온 쪽에서는 남긴다 (문서 제목인 경우가 많다)
+                    continue
+                gone.add(i)
+                if text in running and text not in dropped and len(dropped) < 3:
+                    dropped.append(text)
+                    repeated.add(re.sub(r"\d+", "#", text))
+        page[1] = [b for i, b in enumerate(blocks) if i not in gone]
     # 쪽 경계에서 끊긴 문단을 앞 쪽에 이어 붙인다
     filled = [p for p in pages if p[1]]
     for prev, nxt in zip(filled, filled[1:]):

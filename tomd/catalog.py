@@ -85,6 +85,8 @@ def _validate(meta, origin):
             warnings.append(f"{origin}: '{key}'는 ToMD가 직접 채우는 항목이라 지정값을 쓰지 않았습니다")
             continue
         v = _clean_value(value)
+        if key == "year" and isinstance(v, str) and re.fullmatch(r"\d{4}", v):
+            v = int(v)  # "2027"과 2027을 같게 (명령행 값과 맞춤)
         if v is None:
             warnings.append(f"{origin}: '{key}' 값은 글자·숫자·목록만 쓸 수 있습니다")
             continue

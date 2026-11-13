@@ -15,7 +15,7 @@ BIG_PDF_PAGES = 40            # 이 쪽수 이상인 PDF는 여러 프로세스�
 BIG_FILE_BYTES = 3_000_000    # 이보다 큰 다른 문서도 별도 프로세스에서
 BATCH_FILES = 4               # 한 번에 이보다 많은 파일이면 여러 프로세스로 동시에
 BIG_FOLDER_FILES = 300        # 폴더 안 문서가 이보다 많으면 변환 전에 물어본다
-SUPPORTED = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".docx", ".pptx", ".odt", ".html", ".htm")
+SUPPORTED = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".docx", ".pptx", ".odt", ".html", ".htm", ".txt")
 STALE_SECONDS = 600
 
 
@@ -136,6 +136,7 @@ def _convert_whole(path):
         ".xls": office.convert_xls,
         ".csv": office.convert_csv,
         ".tsv": office.convert_csv,
+        ".txt": office.convert_txt,
         ".docx": office.convert_docx,
         ".pptx": office.convert_pptx,
     }

@@ -76,6 +76,26 @@ def _styles(*roots):
     return resolve, is_hidden, numbered
 
 
+_TABLE_LINE = re.compile(r"\s*(\||</?(?:table|tr|td|th)\b)")
+
+
+def _hard_breaks(text):
+    """문단 안 줄바꿈을 마크다운 강제 줄바꿈(끝 빈칸 2개)으로. 글상자에서 온 표는 앞뒤를 빈 줄로 떼어
+    표로 읽히게 하고, 표 줄에는 빈칸을 붙이지 않는다."""
+    out = []
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        is_table = bool(_TABLE_LINE.match(line))
+        if out:
+            was_table = bool(_TABLE_LINE.match(out[-1]))
+            if is_table != was_table:
+                out.append("")
+            elif not is_table:
+                out[-1] += "  "
+        out.append(line)
+    return "\n".join(out)
+
+
 class _Doc:
     def __init__(self, styles):
         self.resolve, self.is_hidden, self.numbered = styles
@@ -167,7 +187,7 @@ class _Doc:
                 if markup:
                     text = re.sub(r"<(?=[A-Za-z/!?])", "&lt;", text)  # 글 속 <b> 같은 글자가 태그로 읽히지 않게
                 if text:
-                    out.append(text.replace("\n", "  \n") if markup else text)
+                    out.append(_hard_breaks(text) if markup else text)
             elif tag == _t(TEXT, "h"):
                 text = _clean(self.inline(el, markup=False)).replace("\n", " ")
                 if text:

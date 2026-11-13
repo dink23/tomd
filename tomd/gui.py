@@ -80,7 +80,8 @@ def run(engine):
             button.configure(text="닫기")
             if snap["failures"]:
                 title.configure(text=f"변환하지 못한 파일이 {len(snap['failures'])}개 있습니다")
-                detail.configure(text=f"성공 {snap['ok']}개, 실패 {len(snap['failures'])}개")
+                skipped = f", 이미 변환되어 건너뜀 {len(snap['skipped'])}개" if snap["skipped"] else ""
+                detail.configure(text=f"성공 {snap['ok']}개, 실패 {len(snap['failures'])}개{skipped}")
                 errors.insert("1.0", "\n".join(f"· {n}: {m}" for n, m in snap["failures"]))
                 errors.configure(state="disabled")
                 errors.pack(fill="x", pady=(8, 0), before=button)

@@ -3,6 +3,7 @@ import csv
 import datetime
 import decimal
 import io
+import os
 import re
 
 from . import table
@@ -625,6 +626,11 @@ def _spreadsheet_xml(text):
 
 def read_text(path):
     data = open(path, "rb").read()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):  # 엑셀 '유니코드 텍스트' 저장 등
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
     for enc in ("utf-8-sig", "cp949", "utf-16"):
         try:
             return data.decode(enc)
@@ -633,24 +639,124 @@ def read_text(path):
     return data.decode("utf-8", errors="replace")
 
 
-def convert_csv(path):
-    text = read_text(path)
-    delimiter = "\t" if str(path).lower().endswith(".tsv") else ","
-    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+def _grid_md(rows, strip=False):
+    if strip:
+        rows = [[c.strip() for c in r] for r in rows]
     width = max((len(r) for r in rows), default=0)
     grid = [r + [""] * (width - len(r)) for r in rows]
     return table.render(table.from_grid(grid))
 
 
+def convert_csv(path):
+    text = read_text(path)
+    tsv = str(path).lower().endswith(".tsv")
+    rows = list(csv.reader(io.StringIO(text), delimiter="\t" if tsv else ","))
+    # 엑셀이 탭 구분으로 저장하면 숫자 뒤에 빈칸이 붙는다 ("31,104,000 ")
+    return _grid_md(rows, strip=tsv)
+
+
+def _tab_rows(text):
+    """탭으로 나눈 표처럼 보이면 행 목록, 아니면 None (엑셀의 '텍스트(탭으로 분리)' 저장 파일 등)."""
+    if "\t" not in text:
+        return None
+    try:
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+    except csv.Error:
+        return None
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if len(rows) < 2:
+        return None
+    multi = [r for r in rows if len(r) > 1]
+    if len(multi) < 0.8 * len(rows):
+        return None
+    counts = {}
+    for r in multi:
+        counts[len(r)] = counts.get(len(r), 0) + 1
+    if max(counts.values()) < 0.6 * len(multi):
+        return None
+    return rows
+
+
+TXT_LIMIT = 50_000_000
+
+
+def _indent(line):
+    """줄 앞 들여쓰기를 보이는 빈칸으로 (마크다운이 코드 블록으로 읽지 않게)."""
+    body = line.lstrip(" \t")
+    lead = line[: len(line) - len(body)]
+    width = sum(4 if ch == "\t" else 1 for ch in lead)
+    return "\u00a0" * width + body
+
+
+def convert_txt(path):
+    """텍스트 파일. 탭으로 나뉜 표면 표로, 아니면 줄바꿈을 살린 글로."""
+    if os.path.getsize(path) > TXT_LIMIT:
+        raise ValueError(f"텍스트 파일이 너무 큽니다 ({TXT_LIMIT // 1_000_000}MB 초과). 기록(로그) 파일은 변환하지 않습니다.")
+    text = read_text(path).replace("\r\n", "\n").replace("\r", "\n")
+    rows = _tab_rows(text)
+    if rows is not None:
+        return _grid_md(rows, strip=True)
+    paragraphs = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        lines = [ln.rstrip() for ln in block.split("\n")]
+        lines = [_indent(ln.replace("<", "&lt;")) for ln in lines if ln.strip()]
+        if lines:
+            paragraphs.append("  \n".join(lines))  # 원래 줄바꿈을 그대로 보이게
+    return "\n\n".join(paragraphs)
+
+
 # ---------------------------------------------------------------- 워드
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+_TXBX = (W + "txbxContent",)
+
+
+def _docx_iter(el, tag, skip=()):
+    """el 아래의 tag 요소들. 호환용 사본(mc:Fallback — 같은 글상자가 옛 형식으로 한 번 더 들어 있음)과
+    skip 에 든 요소의 안쪽은 보지 않는다."""
+    for child in el:
+        if child.tag == _MC_FALLBACK or child.tag in skip:
+            continue
+        if child.tag == tag:
+            yield child
+        yield from _docx_iter(child, tag, skip)
+
+
+def _docx_tiny(box):
+    """눈에 보이지 않을 만큼 작은 글상자(가로·세로 3mm 미만). PDF를 워드로 바꾼 파일에 흔한 찌꺼기."""
+    node = box.getparent() if hasattr(box, "getparent") else None
+    while node is not None:
+        if node.tag.endswith("}wsp"):
+            for ext in node.iter("{http://schemas.openxmlformats.org/drawingml/2006/main}ext"):
+                try:
+                    return int(ext.get("cx", "0")) < 100000 and int(ext.get("cy", "0")) < 100000
+                except ValueError:
+                    return False
+            return False
+        node = node.getparent()
+    return False
+
+
+def _docx_boxes(p):
+    """문단에 붙은 글상자 속 문단·표들 (글상자 안의 글상자도 차례로)."""
+    out = []
+    for box in _docx_iter(p, W + "txbxContent"):
+        if _docx_tiny(box):
+            continue
+        for inner in box:
+            if inner.tag == W + "tbl":
+                out.append(inner)
+            elif inner.tag == W + "p":
+                out.append(inner)
+                out.extend(_docx_boxes(inner))
+    return out
 
 
 def _docx_runs(p):
-    """문단의 글자를 굵게/기울임 표시와 함께 이어 붙인다."""
+    """문단의 글자를 굵게/기울임 표시와 함께 이어 붙인다 (글상자 속 글은 따로 다룬다)."""
     pieces = []  # (text, bold, italic)
-    for r in p.iter(W + "r"):
+    for r in _docx_iter(p, W + "r", _TXBX):
         text = ""
         for node in r:
             if node.tag == W + "t":
@@ -709,7 +815,7 @@ def _docx_table(tbl):
                 open_merge[col].rowspan += 1
             else:
                 text = "\n".join(
-                    t for t in (_docx_text(p, markup=False) for p in tc.iter(W + "p")) if t
+                    t for t in (_docx_text(p, markup=False) for p in _docx_iter(tc, W + "p")) if t
                 )
                 cell = Cell(r, col, text, 1, span)
                 cells.append(cell)
@@ -740,34 +846,46 @@ def convert_docx(path):
             continue
         if el.tag != W + "p":
             continue
-        ppr = el.find(W + "pPr")
-        style_name, is_list = "", False
-        if ppr is not None:
-            ps = ppr.find(W + "pStyle")
-            if ps is not None:
-                style_name = styles.get(ps.get(W + "val"), ps.get(W + "val") or "")
-            is_list = ppr.find(W + "numPr") is not None
-        low = style_name.lower()
-        m = re.match(r"(heading|제목)\s*(\d)", low)
-        if m or low == "title":
-            text = _docx_text(el, markup=False)
-            if text:
-                level = 1 if not m else min(int(m.group(2)), 6)
-                out.append("#" * level + " " + text.replace("\n", " "))
-            continue
-        text = _docx_text(el)
-        if not text:
-            continue
-        if is_list or low.startswith("list"):
-            marker = "1. " if "number" in low else "- "
-            item = marker + text.replace("\n", " ")
-            if out and re.match(r"(- |1\. )", out[-1].splitlines()[-1]):
-                out[-1] += "\n" + item
+        _docx_para(el, styles, out)
+        for inner in _docx_boxes(el):
+            if inner.tag == W + "tbl":
+                rendered = _docx_table(inner)
+                if rendered:
+                    out.append(rendered)
             else:
-                out.append(item)
-        else:
-            out.append(text.replace("\n", "  \n"))
+                _docx_para(inner, styles, out)
     return "\n\n".join(out)
+
+
+def _docx_para(el, styles, out):
+    """본문 문단 하나를 마크다운으로 바꿔 out 에 붙인다."""
+    ppr = el.find(W + "pPr")
+    style_name, is_list = "", False
+    if ppr is not None:
+        ps = ppr.find(W + "pStyle")
+        if ps is not None:
+            style_name = styles.get(ps.get(W + "val"), ps.get(W + "val") or "")
+        is_list = ppr.find(W + "numPr") is not None
+    low = style_name.lower()
+    m = re.match(r"(heading|제목)\s*(\d)", low)
+    if m or low == "title":
+        text = _docx_text(el, markup=False)
+        if text:
+            level = 1 if not m else min(int(m.group(2)), 6)
+            out.append("#" * level + " " + text.replace("\n", " "))
+        return
+    text = _docx_text(el)
+    if not text:
+        return
+    if is_list or low.startswith("list"):
+        marker = "1. " if "number" in low else "- "
+        item = marker + text.replace("\n", " ")
+        if out and re.match(r"(- |1\. )", out[-1].splitlines()[-1]):
+            out[-1] += "\n" + item
+        else:
+            out.append(item)
+    else:
+        out.append(text.replace("\n", "  \n"))
 
 
 # ---------------------------------------------------------------- 파워포인트

@@ -3,7 +3,7 @@ import configparser
 import os
 import sys
 
-__version__ = "20"
+__version__ = "21"
 
 
 def version_label():

@@ -13,6 +13,19 @@ class ConvertError(Exception):
     pass
 
 
+def _plain(block):
+    """표 칸 안에 든 표·글상자를 칸 안에 넣을 수 있는 평범한 글로 바꾼다."""
+    if block.startswith("<table>"):
+        return re.sub(r"<[^>]+>", " ", block)
+    lines = block.split("\n")
+    if all(line.startswith(">") for line in lines):
+        return "\n".join(line[1:].strip() for line in lines)
+    if len(lines) >= 2 and lines[0].startswith("| ") and re.fullmatch(r"\|( --- \|)+", lines[1]):
+        rows = [ln.strip().strip("|").strip() for ln in lines[:1] + lines[2:]]
+        return "\n".join(re.sub(r"\s*(?<!\\)\|\s*", " / ", row).replace("\\|", "|").replace("\\\\", "\\") for row in rows)
+    return block
+
+
 # ---------------------------------------------------------------- HWPX
 
 def _local(tag):
@@ -39,7 +52,7 @@ def _hwpx_paragraph(p, blocks):
     text = []
 
     def flush():
-        joined = "".join(text).strip()
+        joined = _tidy("".join(text))
         text.clear()
         if joined:
             blocks.append(joined.replace("\n", "  \n"))
@@ -49,6 +62,8 @@ def _hwpx_paragraph(p, blocks):
             name = _local(child.tag)
             if name == "t":
                 text.append(_hwpx_t(child))
+            elif name == "autoNum":
+                text.append(child.get("num", ""))  # 번호 넣기(그림·표 번호 등). newNum(새 번호로 시작)은 보이지 않는다
             elif name == "tbl":
                 flush()
                 rendered = _hwpx_table(child)
@@ -75,7 +90,7 @@ def _hwpx_cell_text(tc):
                 if _local(p.tag) == "p":
                     _hwpx_paragraph(p, blocks)
     # 셀 안의 표는 글자만 남긴다
-    plain = [re.sub(r"<[^>]+>", " ", b) if b.startswith("<table>") else b for b in blocks]
+    plain = [_plain(b) for b in blocks]
     return "\n".join(plain)
 
 
@@ -93,7 +108,7 @@ def _hwpx_table(tbl):
                     cs = int(sub.get("colSpan", 1))
                     rs = int(sub.get("rowSpan", 1))
             cells.append(Cell(row, col, _hwpx_cell_text(tc), rs, cs))
-    return table.render(cells)
+    return table.render(cells, single="quote")
 
 
 def convert_hwpx(path):
@@ -120,6 +135,7 @@ TAG_LIST_HEADER = 72
 TAG_TABLE = 77
 
 _CHAR_CONTROLS = {0, 10, 13, 24, 25, 26, 27, 28, 29, 30, 31}
+_AUTO_NUMBER = "\x00"  # 문서 글에는 나올 수 없는 글자 (0번은 제어 문자)
 
 
 class _Rec:
@@ -172,6 +188,8 @@ def _para_text(data):
             else:
                 if code == 9:
                     chars.append("\t")
+                elif code == 18:
+                    chars.append(_AUTO_NUMBER)  # 번호 넣기(그림·표 번호 등): 문단에서 번호로 바꾼다
                 i += 8
             continue
         chars.append(chr(code))
@@ -189,10 +207,23 @@ def _hwp_blocks(nodes, blocks):
             _hwp_blocks(node.children, blocks)
 
 
+def _tidy(text):
+    """문단 안의 탭과 겹친 빈칸을 한 칸으로 (줄바꿈은 둔다)."""
+    return "\n".join(re.sub(r"[ \t\u3000]{2,}|\t", " ", line).strip() for line in text.split("\n")).strip()
+
+
 def _hwp_paragraph(para, blocks):
     text = "".join(
         _para_text(c.data) for c in para.children if c.tag == TAG_PARA_TEXT
     ).strip()
+    if _AUTO_NUMBER in text:
+        numbers = []
+        for ctrl in para.children:
+            if ctrl.tag == TAG_CTRL_HEADER and ctrl.data[:4] == b"onta" and len(ctrl.data) >= 10:
+                numbers.append(str(struct.unpack_from("<H", ctrl.data, 8)[0]))
+        parts = text.split(_AUTO_NUMBER)
+        text = parts[0] + "".join((numbers[i] if i < len(numbers) else "") + p for i, p in enumerate(parts[1:]))
+    text = _tidy(text)
     if text:
         blocks.append(text.replace("\n", "  \n"))
     for ctrl in para.children:
@@ -225,12 +256,9 @@ def _hwp_table(ctrl):
             _hwp_paragraph(child, current["blocks"])
     out = []
     for c in cells:
-        plain = [
-            re.sub(r"<[^>]+>", " ", b) if b.startswith("<table>") else b
-            for b in c["blocks"]
-        ]
+        plain = [_plain(b) for b in c["blocks"]]
         out.append(Cell(c["row"], c["col"], "\n".join(plain), c["rs"], c["cs"]))
-    return table.render(out)
+    return table.render(out, single="quote")
 
 
 def convert_hwp(path):

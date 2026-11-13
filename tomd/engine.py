@@ -1,5 +1,7 @@
 """변환 작업 관리: 대기열, 단일 실행, 여러 프로세스 동시 처리, 진행률."""
 import json
+import datetime
+import re
 import os
 import threading
 import time
@@ -120,6 +122,36 @@ def _convert_pdf_range(path, start, end):
     return pdf.convert_range(path, start, end)
 
 
+def _yaml(value):
+    """YAML 값 하나 (문자열은 큰따옴표로 감싸 콜론·# 같은 글자도 안전하게)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def document(source, body, pages=None):
+    """변환 결과 전체: 문서 정보(YAML 머리말) + 제목 + 본문.
+
+    머리말은 옵시디언의 '속성(Properties)'으로 보이고, 다른 마크다운 도구에서는 대부분 숨겨진다.
+    """
+    from . import version_label
+
+    kind = source.suffix.lower().lstrip(".")
+    meta = [("title", source.stem), ("source", source.name), ("type", kind)]
+    if pages:
+        meta.append(("pages", pages))
+    if kind == "pptx":
+        meta.append(("slides", len(re.findall(r"^## 슬라이드 \d+", body, flags=re.M))))
+    elif kind in ("xlsx", "xlsm", "xls"):
+        sheets = len(re.findall(r"^## ", body, flags=re.M))
+        if sheets:
+            meta.append(("sheets", sheets))
+    meta.append(("converted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    meta.append(("converter", f"ToMD {version_label()}"))
+    lines = ["---"] + [f"{key}: {_yaml(value)}" for key, value in meta] + ["tags:", "  - ToMD", "---"]
+    return "\n".join(lines) + f"\n\n# {source.stem}\n\n{body}\n"
+
+
 def write_new(source, text):
     """기존 파일을 덮어쓰지 않고 새 .md 파일을 만든다."""
     n = 1
@@ -153,7 +185,9 @@ def reason(exc):
     if "No /Root object" in text or names & {"PDFSyntaxError", "PSEOF", "PDFNoValidXRef"}:
         return "PDF 파일이 손상되었거나 PDF 형식이 아닙니다."
     if names & {"BadZipFile", "PackageNotFoundError", "InvalidFileException"}:
-        return "파일이 손상되었거나 확장자와 실제 형식이 다릅니다. 원래 프로그램에서 열어 다시 저장해 보세요."
+        return "파일이 손상되었거나, 문서 보안(DRM)이 걸려 있거나, 확장자와 실제 형식이 다릅니다. 원래 프로그램에서 열어 다시 저장해 보세요."
+    if "XLRDError" in names:
+        return "엑셀(xls) 파일을 읽지 못했습니다. 손상되었거나 문서 보안(DRM)이 걸려 있을 수 있습니다. 엑셀에서 열어 xlsx로 저장한 뒤 다시 변환해 보세요."
     if "PermissionError" in names:
         return "파일을 읽거나 결과를 저장할 권한이 없습니다. 다른 프로그램에서 열려 있거나 쓰기가 막힌 폴더일 수 있습니다."
     if "MemoryError" in names:
@@ -302,11 +336,7 @@ class Engine(threading.Thread):
                 else:
                     body = job.futures[0][0].result()
                 body = (body or "").strip() or "> 이 파일에서 변환할 내용을 찾지 못했습니다."
-                from . import version_label
-
-                target = write_new(
-                    job.path, f"# {job.path.stem}\n\n{body}\n\n<!-- ToMD {version_label()}로 변환 -->\n"
-                )
+                target = write_new(job.path, document(job.path, body, job.pages))
                 with self._state_lock:
                     self.outputs.append(target)
             except Exception as exc:

@@ -300,6 +300,31 @@ def _side_by_side(lines, tol, ytol, page_chars=()):
     return texts
 
 
+def _keep_stream_order(chars):
+    """왼쪽으로 당겨 찍은 글자(낫표 「 같은 전각 문장부호)가 앞 글자보다 앞으로 정렬되지 않게 한다.
+
+    같은 줄에서 바로 앞에 찍힌 글자보다 왼쪽 끝은 앞서지만 가운데는 뒤에 있으면,
+    찍힌 순서가 맞는 순서다. 왼쪽 끝을 앞 글자 바로 뒤로 옮긴다.
+    """
+    out, prev = [], None
+    for ch in chars:
+        if (
+            prev is not None
+            and not ch["text"].isspace()
+            and not prev["text"].isspace()
+            and ch.get("upright", True)
+            and prev.get("upright", True)
+            and abs(ch["top"] - prev["top"]) < 0.3 * max(ch["height"], 1)
+            and ch["x0"] < prev["x0"] < ch["x1"]
+            and (ch["x0"] + ch["x1"]) / 2 > (prev["x0"] + prev["x1"]) / 2
+        ):
+            ch = dict(ch, x0=prev["x0"] + 0.01)
+            ch["width"] = ch["x1"] - ch["x0"]
+        out.append(ch)
+        prev = ch
+    return out
+
+
 def _clean_page(page):
     """쪽 밖에 놓인 도형과 글을 버리고, 겹쳐 찍힌 글자와 줄에서 떨어진 작은 글자를 정리한다."""
     x0, top, x1, bottom = page.bbox
@@ -310,7 +335,7 @@ def _clean_page(page):
             if not ("x0" in o and (o["x1"] < x0 or o["x0"] > x1 or o["bottom"] < top or o["top"] > bottom))
         ]
         if kind == "char":
-            cleaned = _dedupe_chars(_align_small_glyphs(kept))
+            cleaned = _dedupe_chars(_align_small_glyphs(_keep_stream_order(kept)))
             changed = changed or len(cleaned) != len(kept) or any(a is not b for a, b in zip(cleaned, kept))
             kept = cleaned
         changed = changed or len(kept) != len(items)
@@ -1123,7 +1148,8 @@ def assemble(parts, total):
         if not text:
             continue
         if total > 1:
-            out.append(f"<!-- {number}쪽 -->")
+            # 쪽 번호를 소제목으로 둔다: 옵시디언 개요(목차)에서 쪽으로 바로 가고 [[문서#12쪽]]으로 연결할 수 있다
+            out.append(f"## {number}쪽")
         out.append(text)
     if not out:
         return EMPTY_NOTE

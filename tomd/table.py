@@ -1,4 +1,5 @@
 """표를 마크다운(또는 병합 셀이 있으면 HTML)으로 출력한다."""
+import bisect
 import html
 
 
@@ -31,11 +32,39 @@ def _html_text(text):
     return "<br>".join(html.escape(line.strip()) for line in text.splitlines() if line.strip())
 
 
-def render(cells):
-    """Cell 목록을 표 문자열로 만든다. 내용이 없으면 빈 문자열."""
+def _compact(cells):
+    """글이 하나도 없는 행과 열(간격용 빈 줄·빈 칸)을 빼고, 병합 범위를 그에 맞게 줄인다."""
+    rows = sorted({c.row for c in cells if c.text})
+    cols = sorted({c.col for c in cells if c.text})
+    out = []
+    for c in cells:
+        # 칸이 걸친 범위 안에 남는 행·열 (정렬된 목록에서 이분 탐색)
+        r0, r1 = bisect.bisect_left(rows, c.row), bisect.bisect_left(rows, c.row + c.rowspan)
+        k0, k1 = bisect.bisect_left(cols, c.col), bisect.bisect_left(cols, c.col + c.colspan)
+        if r0 >= r1 or k0 >= k1:
+            continue
+        out.append(Cell(r0, k0, c.text, r1 - r0, k1 - k0))
+    # 같은 자리로 모인 칸이 있으면 (원래 겹쳐 있던 칸) 글이 있는 쪽을 남긴다
+    seen = {}
+    for c in out:
+        key = (c.row, c.col)
+        if key not in seen or (c.text and not seen[key].text):
+            seen[key] = c
+    return list(seen.values())
+
+
+def render(cells, single="table"):
+    """Cell 목록을 표 문자열로 만든다. 내용이 없으면 빈 문자열.
+
+    single="quote"면 칸이 하나뿐인 표(글상자)를 인용문으로 쓴다.
+    """
     cells = [c for c in cells if c is not None]
     if not cells or not any(c.text for c in cells):
         return ""
+    cells = _compact(cells)
+    if len(cells) == 1 and single == "quote":
+        lines = [line.strip() for line in cells[0].text.splitlines() if line.strip()]
+        return "\n".join("> " + line + ("  " if i < len(lines) - 1 else "") for i, line in enumerate(lines))
     merged = any(c.rowspan > 1 or c.colspan > 1 for c in cells)
     if merged:
         return _render_html(cells)

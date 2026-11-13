@@ -504,6 +504,8 @@ class Engine(threading.Thread):
         if key in self._seen:
             return
         self._seen.add(key)
+        if path.suffix.lower() == ".md":
+            return  # 변환 결과(.md)를 원본과 함께 골라도 실패로 세지 않고 조용히 넘긴다
         with self._state_lock:
             self.files_total += 1
             self.current = path.name

@@ -311,8 +311,12 @@ def _doc_blocks(chars, runs):
             rows.append(row)
             row = []
         if rows:
+            for r in rows:  # 행 끝의 빈 칸은 저장 방식에 따라 생기는 찌꺼기일 수 있어 먼저 뗀다
+                while len(r) > 1 and not r[-1]:
+                    r.pop()
             width = max(len(r) for r in rows)
-            grid = [r + [""] * (width - len(r)) for r in rows]
+            # 칸이 모자란 행은 대개 첫 칸이 위 행과 세로로 합쳐진 것이다 (합쳐진 칸이 빠진 채 저장된 파일)
+            grid = [[""] * (width - len(r)) + r for r in rows]
             rendered = table.render(table.from_grid(grid), single="quote")
             if rendered:
                 blocks.append(rendered)
@@ -348,9 +352,8 @@ def _doc_blocks(chars, runs):
 
 
 def _escape(line):
-    line = line.replace("<", "&lt;")
-    if re.match(r"(#{1,6}|>|[-*+]|\d+[.)])\s", line) or line.startswith("|"):
-        line = "\\" + line  # 마크다운 문법으로 읽히지 않게
+    if re.match(r"(#{1,6}|>)\s", line):
+        line = "\\" + line  # 제목·인용 문법으로 읽히지 않게
     return line
 
 

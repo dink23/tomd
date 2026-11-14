@@ -58,6 +58,8 @@ def check(path, kind, body, parts=None, total=None):
         warnings += _pdf(parts, total or len(parts))
     if kind in ("xlsx", "xlsm"):
         warnings += _xlsx(path)
+    if re.search(r"^> 변경 내용 추적으로 고친 곳이 아직 수락되지 않은", body, flags=re.M):
+        warnings.append("수락하지 않은 변경 내용(넣은 글·지운 글)이 있어 최종본 기준으로 옮겼습니다. 원본에서 확정 여부를 확인하세요.")
     if re.search(r"^> 이 컴퓨터에서 (워드|파워포인트)를 쓸 수 없어", body, flags=re.M):
         warnings.append("오피스 프로그램 없이 글자만 꺼냈습니다. 표·목록·서식이 원본과 다를 수 있습니다.")
     if kind in ("pptx", "ppt"):

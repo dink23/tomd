@@ -296,6 +296,88 @@ def _same_meta(front, meta, explicit_id):
     return True
 
 
+# 실제 형식 → (사람이 읽는 이름, 바꿀 확장자)
+_KIND_NAME = {
+    "docx": ("워드 파일", ".docx"), "xlsx": ("엑셀 파일", ".xlsx"), "pptx": ("파워포인트 파일", ".pptx"),
+    "hwpx": ("한글 파일", ".hwpx"), "hwp": ("한글 파일", ".hwp"), "odt": ("오픈문서 글 파일", ".odt"),
+    "ods": ("오픈문서 표 파일", ".ods"), "odp": ("오픈문서 발표 파일", ".odp"),
+    "doc": ("워드 97-2003 파일", ".doc"), "xls": ("엑셀 97-2003 파일", ".xls"),
+    "ppt": ("파워포인트 97-2003 파일", ".ppt"), "pdf": ("PDF 파일", ".pdf"),
+    "encrypted": ("암호가 걸린 오피스 파일", None),
+}
+# 확장자마다 그대로 변환할 수 있는 실제 형식 (None: 알 수 없는 형식 — 변환기에 맡긴다)
+_ACCEPT = {
+    ".docx": {"docx"}, ".xlsx": {"xlsx", "xls", "encrypted"}, ".xlsm": {"xlsx", "xls", "encrypted"},
+    ".xls": {"xls", "xlsx"}, ".pptx": {"pptx"}, ".hwp": {"hwp", "hwpx"}, ".hwpx": {"hwp", "hwpx"},
+    ".odt": {"odt"}, ".doc": {"doc"}, ".ppt": {"ppt"}, ".pdf": {"pdf"},
+}
+
+
+def _sniff(path):
+    """파일 앞부분과 내부 목록으로 실제 형식을 알아낸다. 모르면 None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return None
+    if b"%PDF-" in head[:1024]:
+        return "pdf"
+    if head.startswith(b"PK"):
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                mime = z.read("mimetype").decode("ascii", "ignore").strip() if "mimetype" in names else ""
+        except Exception:
+            return None
+        if "word/document.xml" in names:
+            return "docx"
+        if "xl/workbook.xml" in names:
+            return "xlsx"
+        if "ppt/presentation.xml" in names:
+            return "pptx"
+        if mime.startswith("application/hwp") or "Contents/section0.xml" in names:
+            return "hwpx"
+        return {"application/vnd.oasis.opendocument.text": "odt",
+                "application/vnd.oasis.opendocument.spreadsheet": "ods",
+                "application/vnd.oasis.opendocument.presentation": "odp"}.get(mime)
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        import olefile
+
+        try:
+            with olefile.OleFileIO(path) as ole:
+                if ole.exists("EncryptedPackage"):
+                    return "encrypted"
+                if ole.exists("FileHeader") and ole.exists("BodyText"):
+                    return "hwp"
+                if ole.exists("WordDocument"):
+                    return "doc"
+                if ole.exists("Workbook") or ole.exists("Book"):
+                    return "xls"
+                if ole.exists("PowerPoint Document"):
+                    return "ppt"
+        except Exception:
+            return None
+    return None
+
+
+def _check_format(path, ext):
+    """확장자와 실제 형식이 다르면 알기 쉬운 안내로 멈춘다."""
+    accept = _ACCEPT.get(ext)
+    if not accept:
+        return
+    kind = _sniff(path)
+    if kind is None or kind in accept:
+        return
+    if kind == "encrypted":
+        raise ValueError("암호가 걸린 문서입니다. 원래 프로그램에서 암호를 풀고 저장한 뒤 변환하세요.")
+    name, right = _KIND_NAME[kind]
+    if right in SUPPORTED:
+        raise ValueError(f"확장자는 {ext}이지만 실제로는 {name}입니다. 확장자를 {right}{'으로' if right == '.doc' else '로'} 바꿔 변환하세요.")
+    raise ValueError(f"확장자는 {ext}이지만 실제로는 {name}({right})입니다. 이 형식은 변환하지 않습니다.")
+
+
 class Engine(threading.Thread):
     """대기열을 비울 때까지 변환한다. snapshot()으로 진행 상황을 읽는다."""
 
@@ -522,6 +604,11 @@ class Engine(threading.Thread):
             empty = False
         if empty:
             self._fail(path, ValueError("빈 파일(0바이트)입니다."))
+            return
+        try:
+            _check_format(path, ext)
+        except Exception as exc:
+            self._fail(path, exc)
             return
         job = _Job(path)
         try:

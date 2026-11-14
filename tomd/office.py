@@ -1040,10 +1040,95 @@ def _docx_boxes(p):
     return out
 
 
+M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+# 문서 하나를 바꾸는 동안 각주·미주·메모 번호를 매긴다 (convert_docx 가 채운다)
+_NOTES = {"foot": {}, "end": {}, "comment": {}}
+_NOTE_LABEL = {"foot": "", "end": "미주", "comment": "메모"}
+
+
+def _note_ref(kind, note_id):
+    table_ = _NOTES[kind]
+    if note_id not in table_:
+        table_[note_id] = len(table_) + 1
+    return f"[^{_NOTE_LABEL[kind]}{table_[note_id]}]"
+
+
+def _docx_inline(el, skip=()):
+    """문단 안의 글자 조각(w:r)과 수식(m:oMath)을 문서 순서대로. 지운 글·옮겨 간 원래 자리는 건너뛴다."""
+    for child in el:
+        if child.tag == _MC_FALLBACK or child.tag in skip or child.tag in (W + "del", W + "moveFrom"):
+            continue
+        if child.tag == W + "r" or child.tag == M + "oMath":
+            yield child
+        else:
+            yield from _docx_inline(child, skip)
+
+
+_NARY = {"∑": r"\sum", "∏": r"\prod", "∫": r"\int", "∬": r"\iint", "∭": r"\iiint", "∮": r"\oint",
+         "⋃": r"\bigcup", "⋂": r"\bigcap"}
+
+
+def _omml(el):
+    """워드 수식(OMML)을 LaTeX 글로 바꾼다 (자주 쓰는 구조만, 나머지는 안의 글을 그대로)."""
+    def part(name):
+        child = el.find(M + name)
+        return _omml(child) if child is not None else ""
+
+    def prop(pr_name, key, default=""):
+        pr = el.find(M + pr_name)
+        node = pr.find(M + key) if pr is not None else None
+        return node.get(M + "val", default) if node is not None else default
+
+    tag = el.tag
+    if tag == M + "r":
+        return "".join(t.text or "" for t in el.iter(M + "t"))
+    if tag == M + "f":
+        return r"\frac{" + part("num") + "}{" + part("den") + "}"
+    if tag == M + "sSup":
+        return "{" + part("e") + "}^{" + part("sup") + "}"
+    if tag == M + "sSub":
+        return "{" + part("e") + "}_{" + part("sub") + "}"
+    if tag == M + "sSubSup":
+        return "{" + part("e") + "}_{" + part("sub") + "}^{" + part("sup") + "}"
+    if tag == M + "rad":
+        deg = part("deg")
+        return (r"\sqrt[" + deg + "]{" if deg else r"\sqrt{") + part("e") + "}"
+    if tag == M + "d":
+        beg, end, sep = prop("dPr", "begChr", "("), prop("dPr", "endChr", ")"), prop("dPr", "sepChr", ",")
+        inner = sep.join(_omml(e) for e in el.findall(M + "e"))
+        beg = {"{": r"\{", "": "."}.get(beg, beg)
+        end = {"}": r"\}", "": "."}.get(end, end)
+        return r"\left" + beg + inner + r"\right" + end
+    if tag == M + "nary":
+        op = prop("naryPr", "chr", "∫")
+        out = _NARY.get(op, op)
+        sub, sup = part("sub"), part("sup")
+        if sub:
+            out += "_{" + sub + "}"
+        if sup:
+            out += "^{" + sup + "}"
+        return out + " " + part("e")
+    if tag == M + "func":
+        return part("fName") + " " + part("e")
+    if tag == M + "eqArr":
+        return r" \\ ".join(_omml(e) for e in el.findall(M + "e"))
+    if tag == M + "bar":
+        return r"\overline{" + part("e") + "}"
+    if tag.endswith("Pr") or tag == W + "rPr":
+        return ""
+    return "".join(_omml(child) for child in el)
+
+
 def _docx_runs(p):
-    """문단의 글자를 굵게/기울임 표시와 함께 이어 붙인다 (글상자 속 글은 따로 다룬다)."""
+    """문단의 글자를 굵게/기울임 표시와 함께 이어 붙인다 (글상자 속 글은 따로 다룬다).
+    각주·미주·메모 자리에는 [^1] 같은 표시를, 수식은 $LaTeX$ 로 넣는다."""
     pieces = []  # (text, bold, italic)
-    for r in _docx_iter(p, W + "r", _TXBX):
+    for r in _docx_inline(p, _TXBX):
+        if r.tag == M + "oMath":
+            latex = re.sub(r"\s+", " ", _omml(r)).strip()
+            if latex:
+                pieces.append((f"${latex}$", False, False))
+            continue
         text = ""
         for node in r:
             if node.tag == W + "t":
@@ -1052,6 +1137,12 @@ def _docx_runs(p):
                 text += "\t"
             elif node.tag in (W + "br", W + "cr"):
                 text += "\n"
+            elif node.tag == W + "footnoteReference":
+                text += _note_ref("foot", node.get(W + "id"))
+            elif node.tag == W + "endnoteReference":
+                text += _note_ref("end", node.get(W + "id"))
+            elif node.tag == W + "commentReference":
+                text += _note_ref("comment", node.get(W + "id"))
         if not text:
             continue
         rpr = r.find(W + "rPr")
@@ -1101,10 +1192,7 @@ def _docx_table(tbl):
             if vmerge == "continue" and col in open_merge:
                 open_merge[col].rowspan += 1
             else:
-                text = "\n".join(
-                    t for t in (_docx_text(p, markup=False) for p in _docx_iter(tc, W + "p")) if t
-                )
-                cell = Cell(r, col, text, 1, span)
+                cell = Cell(r, col, "\n".join(_docx_cell_lines(tc)), 1, span)
                 cells.append(cell)
                 if vmerge == "restart":
                     open_merge[col] = cell
@@ -1114,7 +1202,83 @@ def _docx_table(tbl):
     return table.render(cells, single="quote")
 
 
+def _docx_cell_lines(el):
+    """표 칸의 글 줄들. 칸 안의 작은 표는 행마다 '가 · 나' 한 줄로 넣는다."""
+    lines = []
+    for child in el:
+        if child.tag == _MC_FALLBACK:
+            continue
+        if child.tag == W + "p":
+            text = _docx_text(child, markup=False)
+            if text:
+                lines.append(text)
+        elif child.tag == W + "tbl":
+            for tr in child.findall(W + "tr"):
+                row = [" ".join(_docx_cell_lines(tc)).strip() for tc in tr.findall(W + "tc")]
+                if any(row):
+                    lines.append(" · ".join(row))
+        else:
+            lines.extend(_docx_cell_lines(child))
+    return lines
+
+
+def _docx_notes(path, _styles=None):
+    """본문에 나온 차례대로 각주·미주·메모 내용을 [^1]: … 꼴로."""
+    import zipfile
+
+    from lxml import etree
+
+    out = []
+    try:
+        z = zipfile.ZipFile(path)
+        names = set(z.namelist())
+    except Exception:
+        return out
+    for kind, part, tag in (("foot", "word/footnotes.xml", "footnote"), ("end", "word/endnotes.xml", "endnote"),
+                            ("comment", "word/comments.xml", "comment")):
+        used = _NOTES[kind]
+        if not used or part not in names:
+            continue
+        try:
+            root = etree.fromstring(z.read(part))
+        except Exception:
+            continue
+        texts = {}
+        for note in root.iter(W + tag):
+            body = " ".join(t for t in (_docx_text(p) for p in note.iter(W + "p")) if t).strip()
+            texts[note.get(W + "id")] = body
+        for note_id, number in sorted(used.items(), key=lambda kv: kv[1]):
+            body = texts.get(note_id, "")
+            out.append(f"[^{_NOTE_LABEL[kind]}{number}]: {body or '(내용 없음)'}")
+    return out
+
+
+def _docx_tracked(path):
+    """수락하지 않은 변경 내용(넣은 글·지운 글)이 남아 있는가."""
+    import zipfile
+
+    try:
+        xml = zipfile.ZipFile(path).read("word/document.xml")
+    except Exception:
+        return False
+    return b"<w:ins " in xml or b"<w:del " in xml or b"<w:moveFrom " in xml
+
+
 def convert_docx(path):
+    for table_ in _NOTES.values():
+        table_.clear()
+    body = _convert_docx_body(path)
+    notes = _docx_notes(path, None)
+    head = []
+    if _docx_tracked(path):
+        head.append("> 변경 내용 추적으로 고친 곳이 아직 수락되지 않은 채 남아 있습니다. 고친 뒤(최종본) 글로 옮겼습니다.")
+    parts = head + ([body] if body else []) + (["\n".join(notes)] if notes else [])
+    for table_ in _NOTES.values():
+        table_.clear()
+    return "\n\n".join(parts)
+
+
+def _convert_docx_body(path):
     import docx
 
     doc = docx.Document(path)
